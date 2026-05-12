@@ -80,11 +80,24 @@ def renderizar() -> None:
     st.caption("⚠️ Capex y MCS están EXCLUIDOS del %PCT de Sea (regla del negocio)")
     
     bus_pct = [bu for bu in summary.bus_orden if bu not in ("Capex", "MCS")]
+    
+    # 🔧 FIX: Los valores vienen como 0.21 (= 21%). Streamlit los formatea con %
     column_config_pct = {
-        bu: st.column_config.NumberColumn(format="%.0f%%") for bu in bus_pct
+        bu: st.column_config.NumberColumn(
+            format="%.1f%%",  # Formato % con 1 decimal
+            help=f"Porcentaje del BU {bu} respecto al total"
+        ) 
+        for bu in bus_pct
     }
+    
+    # Multiplicar por 100 para que el formato % funcione correctamente
+    tabla_pct_mostrar = summary.tabla_pct.copy()
+    for col in tabla_pct_mostrar.columns:
+        if col != "Type":
+            tabla_pct_mostrar[col] = tabla_pct_mostrar[col] * 100
+    
     st.dataframe(
-        summary.tabla_pct,
+        tabla_pct_mostrar,
         use_container_width=True,
         hide_index=True,
         column_config=column_config_pct,
@@ -96,8 +109,10 @@ def renderizar() -> None:
     
     column_config_montos = {
         col: st.column_config.NumberColumn(format="$%.0f")
-        for col in summary.tabla_montos.columns if col != "Arg. Var $"
+        for col in summary.tabla_montos.columns if col not in ("Viewer", "Arg. Var $")
     }
+    column_config_montos["Arg. Var $"] = st.column_config.NumberColumn(format="$%.0f")
+    
     st.dataframe(
         summary.tabla_montos,
         use_container_width=True,

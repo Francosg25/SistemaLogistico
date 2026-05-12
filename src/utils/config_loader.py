@@ -1,12 +1,13 @@
-"""
-Cargador de configuración desde config.yaml
-Centraliza el acceso a parámetros del sistema.
-"""
 import yaml
 from pathlib import Path
 from typing import Any, Dict
 from functools import lru_cache
 
+# Calcula la ruta absoluta al archivo config.yaml basándose en la ubicación de este script
+# __file__ está en src/utils/config_loader.py
+# .parent.parent.parent sube hasta la raíz del proyecto
+RUTA_BASE = Path(__file__).resolve().parent.parent.parent
+RUTA_CONFIG_DEFAULT = RUTA_BASE / "config" / "config.yaml"
 
 class ConfigLoader:
     """Singleton para cargar y acceder a la configuración."""
@@ -14,7 +15,8 @@ class ConfigLoader:
     _instance = None
     _config: Dict[str, Any] = {}
     
-    def __new__(cls, config_path: str = "config.yaml"):
+    # Actualiza el valor por defecto aquí:
+    def __new__(cls, config_path: str = str(RUTA_CONFIG_DEFAULT)):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._cargar(config_path)
