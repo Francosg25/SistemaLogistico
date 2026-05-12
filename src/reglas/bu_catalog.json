@@ -1,0 +1,85 @@
+{
+  "version": "1.0.0",
+  "ultima_actualizacion": "2026-05-12T10:00:00",
+  "bus_conocidos": {
+    "M01": {
+      "descripcion": "Business Unit M01",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["sea", "land", "outbound"],
+      "es_estandar": true,
+      "incluir_en_summary_pct": true
+    },
+    "M19": {
+      "descripcion": "Business Unit M19",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["sea", "land", "outbound"],
+      "es_estandar": true,
+      "incluir_en_summary_pct": true
+    },
+    "M23": {
+      "descripcion": "Business Unit M23",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["sea", "land", "outbound"],
+      "es_estandar": true,
+      "incluir_en_summary_pct": true
+    },
+    "M45": {
+      "descripcion": "Business Unit M45",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["sea", "land", "outbound"],
+      "es_estandar": true,
+      "incluir_en_summary_pct": true
+    },
+    "M46": {
+      "descripcion": "Business Unit M46",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["sea", "land", "outbound"],
+      "es_estandar": true,
+      "incluir_en_summary_pct": true
+    },
+    "Capex": {
+      "descripcion": "Bienes de capital (CAPEX) - se agregan manualmente",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["sea"],
+      "es_estandar": false,
+      "es_especial": true,
+      "incluir_en_summary_pct": false,
+      "razon_exclusion": "Item manual sin peso físico - absorbe 100% del contenedor"
+    },
+    "MCS": {
+      "descripcion": "Master Carton Set / Mixed Carton Shipment",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["sea"],
+      "es_estandar": false,
+      "es_especial": true,
+      "incluir_en_summary_pct": false,
+      "razon_exclusion": "Excluido del %PCT por regla del negocio"
+    },
+    "Machine": {
+      "descripcion": "Maquinaria importada (Land)",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["land"],
+      "es_estandar": false,
+      "es_especial": true,
+      "incluir_en_summary_pct": true
+    },
+    "Miscelaneus": {
+      "descripcion": "Items misceláneos (tapas, charolas, etc.)",
+      "primera_aparicion": "2025-01-01",
+      "ultima_aparicion": "2026-05-01",
+      "operaciones": ["land"],
+      "es_estandar": false,
+      "es_especial": true,
+      "incluir_en_summary_pct": true
+    }
+  },
+  "historial_cambios": []
+}
