@@ -1,0 +1,113 @@
+# ============================================================
+# CONFIGURACIÓN DEL SISTEMA DE CONSOLIDACIÓN LOGÍSTICA
+# ============================================================
+# Este archivo permite modificar parámetros SIN tocar código
+# ============================================================
+
+aplicacion:
+  nombre: "Consolidación Logística"
+  version: "1.0.0"
+  idioma: "es-MX"
+
+# ============================================================
+# COSTOS FIJOS POR TIPO DE OPERACIÓN
+# ============================================================
+costos:
+  outbound:
+    valor: 1500
+    moneda: "USD"
+    unidad: "por Reference"
+    descripcion: "Costo fijo por cada Waybill/Reference de exportación"
+  
+  sea:
+    valor: 2500
+    moneda: "USD"
+    unidad: "por Contenedor"
+    descripcion: "Costo fijo por cada Container Number"
+  
+  land:
+    valor: 1200
+    moneda: "USD"
+    unidad: "por Reference"
+    descripcion: "Costo fijo por cada Reference terrestre"
+
+# ============================================================
+# REGLAS DE EXCLUSIÓN
+# ============================================================
+exclusiones:
+  summary_pct_sea:
+    bu_excluidos: ["Capex", "MCS"]
+    descripcion: "Estos BU se excluyen del cálculo de %PCT en Summary (Sea)"
+
+# ============================================================
+# REGLAS ESPECIALES - CAPEX
+# ============================================================
+capex:
+  patron_item_code: "CAPEX"  # Si Item Code contiene esta palabra
+  bu_asignado: "Capex"
+  peso: 0
+  pct_pond: 1.0  # 100%
+  origen: "manual"  # Se ingresa manualmente, no viene del reporte
+
+# ============================================================
+# MAPEO DE COLUMNAS POR HOJA
+# ============================================================
+columnas:
+  outbound:
+    fila_encabezado: 8
+    mapeo:
+      inbound_outbound: "B"
+      method: "C"
+      reference: "D"
+      bu: "E"
+      gross_weight: "F"
+      waybill_number: "G"
+      customer: "N"
+      address: "O"
+      item: "AR"
+      qty_pzas: "AS"
+  
+  sea:
+    fila_encabezado: 5
+    mapeo:
+      bu: "B"
+      item_code: "P"
+      container_number: "AZ"
+      total_gross_weight: "BO"
+  
+  land:
+    fila_encabezado: 5
+    mapeo:
+      inbound_outbound: "B"
+      method: "C"
+      reference: "D"
+      bu: "E"
+      peso_bruto: "AZ"
+      no_parte_prov: "BC"
+
+# ============================================================
+# RUTAS
+# ============================================================
+rutas:
+  input: "./data/input"
+  output: "./data/output"
+  logs: "./logs"
+  bu_catalog: "./src/reglas/bu_catalog.json"
+
+# ============================================================
+# LOGGING
+# ============================================================
+logging:
+  nivel: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  archivo: "./logs/app.log"
+  formato: "%(asctime)s | %(levelname)s | %(module)s | %(message)s"
+  rotacion_mb: 10
+  backup_count: 5
+
+# ============================================================
+# VALIDACIONES
+# ============================================================
+validaciones:
+  tolerancia_costo: 0.01  # USD - diferencia aceptable en validación de suma
+  alertar_bu_desconocido: true
+  bloquear_si_error_critico: true
