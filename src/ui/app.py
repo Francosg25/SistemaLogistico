@@ -1,14 +1,3 @@
-"""
-═══════════════════════════════════════════════════════════════
-APP STREAMLIT - CONSOLIDACIÓN LOGÍSTICA
-═══════════════════════════════════════════════════════════════
-Punto de entrada principal de la interfaz.
-Integra los Bloques 1-9 en una experiencia unificada.
-
-Para ejecutar:
-    streamlit run src/ui/app.py
-═══════════════════════════════════════════════════════════════
-"""
 import streamlit as st
 from datetime import datetime
 
@@ -24,18 +13,15 @@ from src.ui.pestanias import (
 )
 
 
-# ============================================================
-# CONFIGURACIÓN DE LA PÁGINA
-# ============================================================
+
 st.set_page_config(
     page_title="Consolidación Logística",
-    page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
         "Get Help": None,
         "Report a bug": None,
-        "About": "📦 Consolidación Logística v1.0 - Software de automatización de costos de fletes.",
+        "About": "Consolidación Logística v1.0 - Software de automatización.",
     },
 )
 

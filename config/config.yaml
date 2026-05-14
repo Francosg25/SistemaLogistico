@@ -111,3 +111,61 @@ validaciones:
   tolerancia_costo: 0.01  # USD - diferencia aceptable en validación de suma
   alertar_bu_desconocido: true
   bloquear_si_error_critico: true
+
+  # ═══════════════════════════════════════════════════════════
+# REGLA MISCELANEUS
+# Reasigna items con palabras clave (plásticos, charolas, etc.)
+# al BU "Miscelaneus" sin importar su BU original detectado.
+# ═══════════════════════════════════════════════════════════
+miscelaneus:
+  # BU destino para los items reasignados
+  bu_destino: "Miscelaneus"
+
+  # Keywords que SIEMPRE reasignan (sin importar si hay guion)
+  palabras_sin_filtro:
+    - "PLASTIC"   # PLASTICA, PLASTICO, PLASTICS
+    - "CHAROLA"   # CHAROLA, CHAROLAS
+
+  # Keywords que reasignan SOLO si el nombre NO contiene guion '-'
+  # (evita falsos positivos con códigos de parte como "BASE-1234")
+  palabras_con_filtro_guion:
+    - "TAPA"      # TAPA PLASTICA → SÍ ; TAPA-1234 → NO
+    - "BASE"      # BASE PLASTICA → SÍ ; BASE-5678 → NO
+    - "CAJA"      # CAJAS PLASTICAS → SÍ ; CAJA-XYZ → NO
+
+# Los alias por defecto están definidos en src/ingesta/mapeo_columnas.py
+# Si necesitas agregar aliases personalizados para tu organización,
+# descomenta y agrega aquí:
+#
+# alias_columnas:
+#   Reference:
+#     - "Nro Pedido"
+#     - "Order ID"
+#   BU:
+#     - "Division"
+#
+# Estos se SUMARÁN a los alias del default.
+
+# ═══════════════════════════════════════════════════════════
+# DETECCIÓN DE HOJAS
+# ═══════════════════════════════════════════════════════════
+deteccion_hojas:
+  # Score mínimo para auto-detectar una hoja como válida
+  score_minimo: 25
+  
+  # Máximo de filas a escanear para detectar encabezado
+  max_filas_escanear: 15
+  
+  # Mínimo de columnas reconocibles para considerar una fila como header
+  min_columnas_header: 3
+  
+  # Hojas a ignorar SIEMPRE (case-insensitive, búsqueda parcial)
+  hojas_ignoradas:
+    - "xdo_metadata"
+    - "metadata"
+    - "config"
+    - "instructions"
+    - "readme"
+    - "summary"
+    - "consolidado"
+

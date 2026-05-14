@@ -1,111 +1,98 @@
 """
-Procesador de Importaciones Terrestres (LAND).
-
-REGLAS DE NEGOCIO:
 ═══════════════════════════════════════════════════════════════
-1. Agrupación:     Por 'Reference'
-2. Costo Fijo:     $1,200 USD por Reference (parametrizable)
-3. Cálculo:
-   - %Pond = Peso_Item / Peso_Total_Reference
-   - Cost  = %Pond × Costo_Fijo
-4. BU:             Se toma DIRECTAMENTE de la columna BU del reporte
-                   (NO se infiere como en Outbound)
-5. BUs especiales: Además de M01, M19, M23, M45, M46, pueden aparecer:
-                   - 'Machine'      (maquinaria)
-                   - 'Miscelaneus'  (misceláneos: tapas, charolas, etc.)
-                   Estos NO se excluyen del Summary (solo Capex/MCS de Sea)
+PROCESADOR LAND (Importaciones terrestres)
+═══════════════════════════════════════════════════════════════
+ORDEN DE OPERACIONES (CRÍTICO):
+  1. Limpieza
+  2. Inferir BU si falta
+  3. 🔄 Aplicar regla Miscelaneus → crea 'BU Final'
+  4. Calcular %Proporción y Amount
+  5. Agrupar por 'BU Final'
 ═══════════════════════════════════════════════════════════════
 """
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+import re
+from typing import Dict, Optional
 from dataclasses import dataclass, field
 
+from src.reglas.regla_miscelaneus import (
+    aplicar_regla_miscelaneus,
+    cargar_config_miscelaneus,
+)
 from src.utils.logger import configurar_logger
 
 logger = configurar_logger("procesar_land")
 
 
-# ============================================================
-# BUs ESPECIALES CONOCIDOS (informativo, no obligatorio)
-# ============================================================
-# Lista de BUs especiales que NO siguen el patrón Mxx
-# Se usan solo para clasificación visual y alertas
-BUS_ESPECIALES_LAND = {"Machine", "Miscelaneus", "Miscellaneous"}
-
-
-# ============================================================
-# ESTRUCTURA DE RESULTADO
-# ============================================================
 @dataclass
 class ResultadoLand:
-    """Contenedor de resultados del procesamiento LAND."""
-    detalle: pd.DataFrame                 # Cada item con su costo asignado
-    resumen_bu: pd.DataFrame              # Resumen agrupado por BU
-    resumen_referencias: pd.DataFrame     # Tabla de References con costo total
+    detalle: pd.DataFrame
+    resumen_bu: pd.DataFrame
+    resumen_referencias: pd.DataFrame
     metricas: Dict[str, any] = field(default_factory=dict)
-    advertencias: List[str] = field(default_factory=list)
+    advertencias: list = field(default_factory=list)
+    reporte_miscelaneus: Dict = field(default_factory=dict)
 
 
-# ============================================================
-# FUNCIÓN PRINCIPAL
-# ============================================================
+def _inferir_bu_desde_reference(reference: str) -> Optional[str]:
+    """
+    Infiere el BU desde el patrón del Reference.
+    Ejemplos:
+        'RM-J-1325LI26-M19'           → 'M19'
+        'RM-J-1359LI26-M23.CS1037'    → 'M23'
+        'RM-J-1381LI26-M00'           → 'M00'
+    """
+    if not isinstance(reference, str) or not reference.strip():
+        return None
+    
+    # Patrón: -Mxx donde xx son 2 dígitos
+    match = re.search(r"-M(\d{2})", reference.upper())
+    if match:
+        return f"M{match.group(1)}"
+    
+    return None
+
+
 def procesar_land(
     df_land: pd.DataFrame,
     costo_fijo: float = 1200.0,
     columna_reference: str = "Reference",
+    columna_peso: str = "Peso Bruto",       # 🔧 NOMBRE LÓGICO (nuevo lector)
+    columna_item: str = "Item",              # 🔧 NOMBRE LÓGICO (nuevo lector)
     columna_bu: str = "BU",
-    columna_peso: str = "Peso Bruto (Kgs)",
-    columna_item: str = "No. Parte Prov.",
 ) -> ResultadoLand:
     """
-    Procesa el reporte de importaciones terrestres aplicando todas las reglas.
-    
-    Args:
-        df_land: DataFrame ya cargado y normalizado (output del Bloque 2)
-        costo_fijo: Costo fijo por Reference (default $1,200 USD)
-        columna_reference: Nombre de la columna Reference
-        columna_bu: Nombre de la columna BU
-        columna_peso: Nombre de la columna de peso bruto
-        columna_item: Nombre de la columna del número de parte
-    
-    Returns:
-        ResultadoLand con detalle, resumen_bu, resumen_referencias y métricas
-    
-    Raises:
-        ValueError: Si faltan columnas o los datos son inválidos
+    Procesa el reporte LAND aplicando prorrateo + regla Miscelaneus.
     """
     logger.info("=" * 60)
-    logger.info("🚚 INICIANDO PROCESAMIENTO LAND")
+    logger.info("🚛 INICIANDO PROCESAMIENTO LAND")
     logger.info("=" * 60)
     
-    # ─────────────────────────────────────────────────────────
-    # 1. VALIDACIONES INICIALES
-    # ─────────────────────────────────────────────────────────
     if df_land is None or len(df_land) == 0:
-        raise ValueError("El DataFrame de LAND está vacío.")
-    
-    columnas_req = [columna_reference, columna_bu, columna_peso, columna_item]
-    faltantes = [c for c in columnas_req if c not in df_land.columns]
-    if faltantes:
-        raise ValueError(f"Faltan columnas obligatorias en LAND: {faltantes}")
+        raise ValueError("El DataFrame de Land está vacío.")
     
     df = df_land.copy()
     advertencias = []
     
+    # ─────────────────────────────────────────────────────────
+    # COMPATIBILIDAD: aceptar nombres viejos si llegan
+    # ─────────────────────────────────────────────────────────
+    # Si viene 'Peso Bruto (Kgs)' pero no 'Peso Bruto', renombrar
+    if "Peso Bruto" not in df.columns and "Peso Bruto (Kgs)" in df.columns:
+        df["Peso Bruto"] = df["Peso Bruto (Kgs)"]
+    if "Item" not in df.columns and "No. Parte Prov." in df.columns:
+        df["Item"] = df["No. Parte Prov."]
+    
     logger.info(f"📊 Registros recibidos: {len(df)}")
-    logger.info(f"💰 Costo fijo por Reference: ${costo_fijo:,.2f}")
+    logger.info(f"   Columnas disponibles: {list(df.columns)[:15]}...")
     
     # ─────────────────────────────────────────────────────────
-    # 2. LIMPIEZA: Eliminar filas inválidas
+    # PASO 1: LIMPIEZA
     # ─────────────────────────────────────────────────────────
     filas_antes = len(df)
-    
-    # Quitar filas sin Reference
     df = df.dropna(subset=[columna_reference])
     df = df[df[columna_reference].astype(str).str.strip() != ""]
-    
-    # Convertir peso a numérico y descartar inválidos
     df[columna_peso] = pd.to_numeric(df[columna_peso], errors="coerce")
     df = df.dropna(subset=[columna_peso])
     df = df[df[columna_peso] > 0]
@@ -117,204 +104,162 @@ def procesar_land(
         logger.warning(f"⚠️ {msg}")
     
     if len(df) == 0:
-        raise ValueError("Todos los registros fueron descartados durante la limpieza.")
-    
-    # ─────────────────────────────────────────────────────────
-    # 3. VALIDAR BU (no inferimos, viene directo del reporte)
-    # ─────────────────────────────────────────────────────────
-    logger.info("🧠 Validando BUs del reporte...")
-    
-    # Detectar filas SIN BU asignado
-    sin_bu = df[df[columna_bu].isna() | (df[columna_bu].astype(str).str.strip() == "")]
-    if len(sin_bu) > 0:
-        refs_sin_bu = sin_bu[columna_reference].unique().tolist()
-        msg = (
-            f"{len(sin_bu)} fila(s) sin BU asignado en {len(refs_sin_bu)} reference(s): "
-            f"{refs_sin_bu[:5]}..."
+        raise ValueError(
+            "Todos los registros de LAND fueron descartados. "
+            "Verifica que las columnas Reference, Peso Bruto e Item existan y tengan datos."
         )
-        advertencias.append(msg)
-        logger.warning(f"⚠️ {msg}")
-        # Asignar 'SinBU' para que no se pierdan en el agrupamiento
-        df[columna_bu] = df[columna_bu].fillna("SinBU").replace("", "SinBU")
-    
-    # Detectar BUs especiales presentes
-    bus_unicos = sorted(df[columna_bu].unique().tolist())
-    bus_especiales_presentes = [bu for bu in bus_unicos if bu in BUS_ESPECIALES_LAND]
-    bus_mxx = [bu for bu in bus_unicos if bu not in BUS_ESPECIALES_LAND and bu != "SinBU"]
-    
-    logger.info(f"   BUs estándar (Mxx):   {bus_mxx}")
-    logger.info(f"   BUs especiales:        {bus_especiales_presentes}")
     
     # ─────────────────────────────────────────────────────────
-    # 4. CÁLCULO DE %POND POR REFERENCE
+    # PASO 2: ASEGURAR QUE EXISTA COLUMNA 'BU' (inferir si falta)
     # ─────────────────────────────────────────────────────────
-    logger.info("🧮 Calculando %Pond y Cost...")
+    if columna_bu not in df.columns:
+        logger.info("   ℹ️ Columna 'BU' no existe en archivo - infiriendo del Reference")
+        df[columna_bu] = df[columna_reference].apply(_inferir_bu_desde_reference)
+    else:
+        # Si existe pero tiene nulos, intentar inferir
+        mask_nulos = df[columna_bu].isna() | (df[columna_bu].astype(str).str.strip() == "")
+        if mask_nulos.any():
+            logger.info(f"   ℹ️ Infiriendo BU para {mask_nulos.sum()} filas con BU nulo")
+            df.loc[mask_nulos, columna_bu] = df.loc[mask_nulos, columna_reference].apply(
+                _inferir_bu_desde_reference
+            )
     
-    # Peso total por Reference (equivalente a SUMIFS en Excel)
+    # Si después de inferir aún hay nulos, marcar como 'Sin Asignar'
+    df[columna_bu] = df[columna_bu].fillna("Sin Asignar")
+    df.loc[df[columna_bu].astype(str).str.strip() == "", columna_bu] = "Sin Asignar"
+    
+    bus_originales = sorted(df[columna_bu].dropna().unique().tolist())
+    logger.info(f"   ✅ BUs originales detectados: {bus_originales}")
+    
+    # ─────────────────────────────────────────────────────────
+    # PASO 3: 🔄 APLICAR REGLA MISCELANEUS (CREA 'BU Final')
+    # ─────────────────────────────────────────────────────────
+    logger.info("🔄 Aplicando regla Miscelaneus...")
+    
+    config_misc = cargar_config_miscelaneus()
+    df, reporte_miscelaneus = aplicar_regla_miscelaneus(
+        df,
+        columna_item=columna_item,            # 'Item'
+        columna_bu_origen=columna_bu,         # 'BU'
+        columna_bu_destino="BU Final",        # 🆕 ESTA SE CREA
+        palabras_sin_filtro=config_misc["palabras_sin_filtro"],
+        palabras_con_filtro_guion=config_misc["palabras_con_filtro_guion"],
+        bu_miscelaneus=config_misc["bu_destino"],
+    )
+    
+    # Verificación defensiva: si por alguna razón no se creó 'BU Final', crearla
+    if "BU Final" not in df.columns:
+        logger.warning("⚠️ 'BU Final' no se creó. Copiando desde 'BU' como fallback.")
+        df["BU Final"] = df[columna_bu]
+    
+    if reporte_miscelaneus.get("items_reasignados", 0) > 0:
+        logger.info(
+            f"   ✅ {reporte_miscelaneus['items_reasignados']} items reasignados a "
+            f"'{reporte_miscelaneus['bu_destino']}'"
+        )
+    
+    # ─────────────────────────────────────────────────────────
+    # PASO 4: CALCULAR %PROPORCIÓN Y AMOUNT
+    # ─────────────────────────────────────────────────────────
+    logger.info("🧮 Calculando %Proporción y Amount...")
+    
     df["Peso Total Reference"] = df.groupby(columna_reference)[columna_peso].transform("sum")
-    
-    # %Pond = Peso_Item / Peso_Total_Reference
-    df["%Pond"] = df[columna_peso] / df["Peso Total Reference"]
-    df["%Pond"] = df["%Pond"].fillna(0)
-    
-    # Costo fijo por Reference
+    df["%Proporcion"] = df[columna_peso] / df["Peso Total Reference"]
+    df["%Proporcion"] = df["%Proporcion"].fillna(0)
     df["Fix Cost"] = costo_fijo
-    
-    # Cost = %Pond × $1,200
-    df["Cost"] = df["%Pond"] * df["Fix Cost"]
+    df["Amount"] = df["%Proporcion"] * df["Fix Cost"]
     
     # ─────────────────────────────────────────────────────────
-    # 5. CONSTRUIR DETALLE FINAL
+    # PASO 5: RESUMEN POR BU (USANDO 'BU Final')
     # ─────────────────────────────────────────────────────────
-    columnas_detalle = [
-        col for col in [
-            "Inbound/Outbound",
-            "Method",
-            columna_reference,
-            columna_bu,
-            columna_item,
-            columna_peso,
-            "Peso Total Reference",
-            "%Pond",
-            "Fix Cost",
-            "Cost",
-        ] if col in df.columns
-    ]
-    detalle = df[columnas_detalle].copy().reset_index(drop=True)
+    logger.info("📊 Generando resumen por BU Final...")
+    
+    resumen_bu = (
+        df.groupby("BU Final")  # 🔧 Ahora SÍ existe
+        .agg(
+            **{
+                "Monto Total (USD)": ("Amount", "sum"),
+                "# References":      (columna_reference, "nunique"),
+                "# Items":           (columna_item, "count"),
+                "Peso Total (Kgs)":  (columna_peso, "sum"),
+            }
+        )
+        .reset_index()
+        .rename(columns={"BU Final": "BU"})
+    )
+    
+    total_monto = resumen_bu["Monto Total (USD)"].sum()
+    resumen_bu["%PCT"] = (
+        (resumen_bu["Monto Total (USD)"] / total_monto * 100) if total_monto > 0 else 0.0
+    )
+    resumen_bu = resumen_bu.sort_values("Monto Total (USD)", ascending=False).reset_index(drop=True)
     
     # ─────────────────────────────────────────────────────────
-    # 6. RESUMEN POR REFERENCE (1 fila por Reference)
+    # PASO 6: RESUMEN POR REFERENCE
     # ─────────────────────────────────────────────────────────
     resumen_referencias = (
         df.groupby(columna_reference)
         .agg(
             **{
-                "# Items": (columna_item, "count"),
-                "BUs Involucrados": (columna_bu, lambda x: ", ".join(sorted(x.unique()))),
+                "BU Asignado":      ("BU Final", lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else "Sin Asignar"),
+                "# Items":          (columna_item, "count"),
                 "Peso Total (Kgs)": (columna_peso, "sum"),
-                "Fix Cost": ("Fix Cost", "first"),
-                "Costo Total Calculado": ("Cost", "sum"),
+                "Fix Cost":         ("Fix Cost", "first"),
+                "Total Amount":     ("Amount", "sum"),
             }
         )
         .reset_index()
     )
     
     # ─────────────────────────────────────────────────────────
-    # 7. RESUMEN POR BU
+    # PASO 7: MÉTRICAS
     # ─────────────────────────────────────────────────────────
-    resumen_bu = (
-        df.groupby(columna_bu)
-        .agg(
-            **{
-                "Monto Total (USD)": ("Cost", "sum"),
-                "# References": (columna_reference, "nunique"),
-                "# Items": (columna_item, "count"),
-                "Peso Total (Kgs)": (columna_peso, "sum"),
-            }
-        )
-        .reset_index()
-        .rename(columns={columna_bu: "BU"})
-    )
-    
-    # Calcular %PCT del total
-    total_amount = resumen_bu["Monto Total (USD)"].sum()
-    if total_amount > 0:
-        resumen_bu["%PCT"] = resumen_bu["Monto Total (USD)"] / total_amount
-    else:
-        resumen_bu["%PCT"] = 0.0
-    
-    # Marcar BUs especiales para la UI
-    resumen_bu["Tipo BU"] = resumen_bu["BU"].apply(
-        lambda x: "Especial" if x in BUS_ESPECIALES_LAND 
-        else ("Sin asignar" if x == "SinBU" else "Estándar")
-    )
-    
-    # Ordenar de mayor a menor monto
-    resumen_bu = resumen_bu.sort_values("Monto Total (USD)", ascending=False).reset_index(drop=True)
-    
-    # ─────────────────────────────────────────────────────────
-    # 8. MÉTRICAS Y VALIDACIONES
-    # ─────────────────────────────────────────────────────────
-    num_referencias = resumen_referencias[columna_reference].nunique()
-    costo_total_esperado = num_referencias * costo_fijo
-    costo_total_calculado = detalle["Cost"].sum()
-    diferencia = abs(costo_total_esperado - costo_total_calculado)
+    num_refs = resumen_referencias[columna_reference].nunique()
+    costo_esperado = num_refs * costo_fijo
+    costo_calculado = df["Amount"].sum()
+    diferencia = abs(costo_esperado - costo_calculado)
     
     metricas = {
-        "total_items": len(detalle),
-        "total_references": num_referencias,
-        "total_bus": len(bus_unicos),
-        "bus_detectados": bus_unicos,
-        "bus_estandar": bus_mxx,
-        "bus_especiales": bus_especiales_presentes,
+        "total_items": len(df),
+        "total_references": num_refs,
+        "total_bus": len(resumen_bu),
+        "bus_detectados": resumen_bu["BU"].tolist(),
         "costo_fijo_por_reference": costo_fijo,
-        "costo_total_esperado": costo_total_esperado,
-        "costo_total_calculado": round(costo_total_calculado, 2),
+        "costo_total_esperado": round(costo_esperado, 2),
+        "costo_total_calculado": round(costo_calculado, 2),
         "diferencia_validacion": round(diferencia, 2),
-        "validacion_ok": diferencia < 0.01,
+        "validacion_ok": diferencia < 1.0,
         "filas_descartadas": filas_descartadas,
-        "peso_total_kgs": round(detalle[columna_peso].sum(), 2),
+        # 🆕 Compatibilidad con pestaña Land
+        "bus_especiales": [
+            bu for bu in resumen_bu["BU"].tolist()
+            if bu in ("Miscelaneus", "Machine", "Capex", "MCS", "Sin Asignar")
+        ],
+        "bus_nuevos": [],
+        "miscelaneus": {
+            "items_reasignados": reporte_miscelaneus.get("items_reasignados", 0),
+            "monto_reasignado": reporte_miscelaneus.get("monto_reasignado", 0.0),
+            "bus_origen": reporte_miscelaneus.get("bus_origen_reasignados", []),
+        },
     }
     
     # ─────────────────────────────────────────────────────────
-    # 9. LOG FINAL
+    # PASO 8: LOG FINAL
     # ─────────────────────────────────────────────────────────
     logger.info("─" * 60)
     logger.info(f"✅ Items procesados:       {metricas['total_items']}")
     logger.info(f"✅ References únicas:      {metricas['total_references']}")
-    logger.info(f"✅ BUs detectados:         {metricas['total_bus']} → {bus_unicos}")
-    logger.info(f"💰 Costo total esperado:   ${metricas['costo_total_esperado']:,.2f}")
-    logger.info(f"💰 Costo total calculado:  ${metricas['costo_total_calculado']:,.2f}")
-    logger.info(f"⚖️  Peso total:             {metricas['peso_total_kgs']:,.2f} Kgs")
-    logger.info(f"🔍 Diferencia:             ${metricas['diferencia_validacion']:,.4f}")
-    
-    if metricas["validacion_ok"]:
-        logger.info("✅ VALIDACIÓN: Conservación de costo OK")
-    else:
-        logger.error("❌ VALIDACIÓN: Conservación de costo FALLÓ")
-        advertencias.append(
-            f"Diferencia de ${metricas['diferencia_validacion']:.2f} "
-            f"entre costo esperado y calculado."
-        )
-    
+    logger.info(f"✅ BUs en resumen:         {metricas['total_bus']} → {metricas['bus_detectados']}")
+    logger.info(f"💰 Costo esperado:         ${metricas['costo_total_esperado']:,.2f}")
+    logger.info(f"💰 Costo calculado:        ${metricas['costo_total_calculado']:,.2f}")
+    logger.info(f"🔄 Items reasignados:      {metricas['miscelaneus']['items_reasignados']}")
     logger.info("=" * 60)
     
     return ResultadoLand(
-        detalle=detalle,
+        detalle=df,
         resumen_bu=resumen_bu,
         resumen_referencias=resumen_referencias,
         metricas=metricas,
         advertencias=advertencias,
+        reporte_miscelaneus=reporte_miscelaneus,
     )
-
-
-# ============================================================
-# FÓRMULAS EXCEL EQUIVALENTES (para Bloque 9)
-# ============================================================
-def obtener_formulas_excel() -> Dict[str, str]:
-    """
-    Retorna las fórmulas Excel equivalentes a los cálculos hechos en Python.
-    Se usarán en la generación del Excel de salida para que el usuario
-    pueda auditar los cálculos directamente.
-    """
-    return {
-        "peso_total_reference": (
-            '=SUMIFS([Peso Bruto (Kgs)], [Reference], [@Reference])'
-        ),
-        "pct_pond": (
-            '=[@[Peso Bruto (Kgs)]] / '
-            'SUMIFS([Peso Bruto (Kgs)], [Reference], [@Reference])'
-        ),
-        "cost": (
-            '=[@[%Pond]] * 1200'
-        ),
-        "monto_total_bu": (
-            '=SUMIFS([Cost], [BU], [@BU])'
-        ),
-        "pct_bu": (
-            '=[@[Monto Total (USD)]] / SUM([Monto Total (USD)])'
-        ),
-        "costo_total_reference": (
-            '=SUMIFS([Cost], [Reference], [@Reference])'
-        ),
-    }

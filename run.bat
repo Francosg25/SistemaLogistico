@@ -19,6 +19,8 @@ if not exist "venv\installed.flag" (
     type nul > venv\installed.flag
 )
 
+set PYTHONPATH=.
+
 REM Ejecutar la aplicación (UI Streamlit)
 echo Lanzando interfaz...
 streamlit run src/ui/app.py

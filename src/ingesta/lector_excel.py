@@ -1,19 +1,22 @@
 """
-Lector de archivos Excel.
-Implementa funciones independientes para cargar SEA, LAND y OUTBOUND.
-
-IMPORTANTE (fix LAND): El archivo land tiene DOS columnas llamadas 'BU' 
-(una en E con los BUs reales, otra en BV con Machine/Miscelaneus).
-Por eso LAND se lee por POSICIÓN de columna (E, AZ, BC), no por nombre.
+═══════════════════════════════════════════════════════════════
+LECTOR DE ARCHIVOS EXCEL — VERSIÓN TOLERANTE
+═══════════════════════════════════════════════════════════════
+🔧 CAMBIO MAYOR: Ya NO usa posiciones fijas de columna (BX, CC).
+   Ahora detecta:
+     1. La hoja correcta por contenido
+     2. La fila de encabezado automáticamente
+     3. Las columnas por NOMBRE con sistema de alias
+═══════════════════════════════════════════════════════════════
 """
 import pandas as pd
+from typing import Union, BinaryIO, Optional, Tuple
 from pathlib import Path
-from typing import Union, BinaryIO
-from openpyxl import load_workbook
 
 from src.ingesta.excepciones import (
     ArchivoInvalidoError,
     HojaNoEncontradaError,
+    ColumnaFaltanteError,
     DatosVaciosError,
 )
 from src.ingesta.normalizador import (
@@ -22,374 +25,346 @@ from src.ingesta.normalizador import (
     eliminar_filas_vacias,
     eliminar_filas_totales,
 )
-from src.ingesta.validador_columnas import validar_columnas
+from src.ingesta.detector_hojas import detectar_hoja_optima, listar_hojas
+from src.ingesta.mapeo_columnas import (
+    mapear_columnas_dataframe,
+    validar_columnas_criticas,
+)
 from src.utils.logger import configurar_logger
 
 logger = configurar_logger("ingesta")
 
 
 # ============================================================
-# CONFIGURACIÓN POR TIPO DE OPERACIÓN
+# FUNCIÓN AUXILIAR DE LECTURA TOLERANTE
 # ============================================================
-CONFIG_HOJAS = {
-    "sea": {
-        "nombres_hoja": ["Sea", "SEA", "sea", "China Maritimos", "Maritimos"],
-        "fila_encabezado": 5,
-        "columnas_clave": ["BU", "Container Number", "Total Gross Weight"],
-    },
-    "land": {
-        "nombres_hoja": ["land", "Land", "LAND", "Terrestre"],
-        "fila_encabezado": 5,
-        "columnas_clave": ["Reference", "BU", "Peso Bruto (Kgs)"],
-    },
-    "outbound": {
-        "nombres_hoja": ["Outbound", "OUTBOUND", "outbound", "Exportaciones"],
-        "fila_encabezado": 8,
-        "columnas_clave": ["Reference", "Waybill Number", "Gross Weight"],
-    },
-}
-
-
-# ============================================================
-# FUNCIONES AUXILIARES
-# ============================================================
-def _detectar_hoja(archivo, nombres_posibles: list) -> str:
-    """Busca el nombre exacto de la hoja en el archivo."""
-    try:
-        # Si es un objeto file-like (Streamlit), reset al inicio
-        if hasattr(archivo, "seek"):
-            archivo.seek(0)
-        wb = load_workbook(archivo, read_only=True, data_only=True)
-        hojas_disponibles = wb.sheetnames
-        wb.close()
-    except Exception as e:
-        raise ArchivoInvalidoError(f"No se pudo abrir el archivo: {e}")
-    
-    for nombre in nombres_posibles:
-        if nombre in hojas_disponibles:
-            return nombre
-    
-    hojas_lower = {h.lower(): h for h in hojas_disponibles}
-    for nombre in nombres_posibles:
-        if nombre.lower() in hojas_lower:
-            return hojas_lower[nombre.lower()]
-    
-    raise HojaNoEncontradaError(nombres_posibles[0], hojas_disponibles)
-
-
-def _leer_excel_con_header(archivo, hoja: str, fila_encabezado: int) -> pd.DataFrame:
-    """Lee un Excel especificando la fila de encabezado."""
-    try:
-        if hasattr(archivo, "seek"):
-            archivo.seek(0)
-        df = pd.read_excel(
-            archivo,
-            sheet_name=hoja,
-            header=fila_encabezado - 1,
-            dtype=object,
-        )
-        df.columns = [str(c).strip() for c in df.columns]
-        return df
-    except Exception as e:
-        raise ArchivoInvalidoError(f"Error al leer la hoja '{hoja}': {e}")
-
-
-def _leer_excel_por_posicion(archivo, hoja: str, fila_encabezado: int, 
-                              columnas_excel: list, nombres_finales: list) -> pd.DataFrame:
+def _leer_hoja_tolerante(
+    archivo,
+    operacion: str,
+    hoja_forzada: Optional[str] = None,
+) -> Tuple[pd.DataFrame, dict]:
     """
-    🆕 NUEVA FUNCIÓN: Lee un Excel seleccionando columnas por POSICIÓN (letra),
-    no por nombre. Útil cuando hay columnas duplicadas con el mismo nombre.
+    Lee una hoja del archivo de forma tolerante a:
+      - Nombres de hoja distintos
+      - Fila de encabezado variable
+      - Nombres de columna con alias
     
     Args:
-        archivo: Ruta o file-like
-        hoja: Nombre de la hoja
-        fila_encabezado: Fila donde están los encabezados (1-indexed)
-        columnas_excel: Lista de letras de columna ['B', 'C', 'D', 'E', 'AZ', 'BC']
-        nombres_finales: Nombres a asignar a esas columnas
+        archivo: Path o file-like
+        operacion: 'land', 'outbound' o 'sea'
+        hoja_forzada: Si se proporciona, fuerza el uso de esa hoja
+                       (útil para fallback con dropdown)
     
     Returns:
-        DataFrame con solo las columnas solicitadas, con nombres correctos
+        Tupla: (df, info_lectura)
+            df: DataFrame con columnas LÓGICAS
+            info_lectura: dict con metadata (hoja usada, fila header, etc.)
     """
-    try:
-        if hasattr(archivo, "seek"):
-            archivo.seek(0)
-        
-        # Construir string "B,C,D,E,AZ,BC" para usecols
-        usecols_str = ",".join(columnas_excel)
-        
-        df = pd.read_excel(
-            archivo,
-            sheet_name=hoja,
-            header=fila_encabezado - 1,
-            usecols=usecols_str,
-            dtype=object,
-        )
-        
-        # Renombrar columnas por POSICIÓN (orden de columnas_excel)
-        # pandas las lee en el orden alfabético de Excel: B, C, D, E, AZ, BC
-        # Necesitamos ordenar nuestros nombres_finales según ese orden
-        from openpyxl.utils import column_index_from_string
-        
-        # Crear pares (letra, nombre) y ordenar por índice de columna
-        pares = list(zip(columnas_excel, nombres_finales))
-        pares.sort(key=lambda x: column_index_from_string(x[0]))
-        
-        # Renombrar en el orden correcto
-        nombres_ordenados = [nombre for letra, nombre in pares]
-        df.columns = nombres_ordenados
-        
-        return df
+    # 1. Detectar hoja óptima (o usar la forzada)
+    if hoja_forzada:
+        from src.ingesta.detector_hojas import analizar_hoja
+        mejor_hoja = analizar_hoja(archivo, hoja_forzada, operacion)
+        todas = [mejor_hoja]
+        if mejor_hoja["ignorada"] or mejor_hoja["score"] < 10:
+            raise HojaNoEncontradaError(
+                hoja_forzada,
+                [h["hoja"] for h in todas],
+            )
+    else:
+        mejor_hoja, todas = detectar_hoja_optima(archivo, operacion)
+        if mejor_hoja is None:
+            hojas_disponibles = [h["hoja"] for h in todas]
+            raise HojaNoEncontradaError(
+                f"Ninguna hoja válida para '{operacion}'",
+                hojas_disponibles,
+            )
     
-    except Exception as e:
-        raise ArchivoInvalidoError(f"Error al leer la hoja '{hoja}' por posición: {e}")
-
-
-# ============================================================
-# FUNCIÓN: CARGAR SEA
-# ============================================================
-def cargar_sea(archivo) -> pd.DataFrame:
-    """Carga el reporte SEA."""
-    logger.info("📥 Cargando archivo SEA...")
-    config = CONFIG_HOJAS["sea"]
+    # 2. Leer la hoja con el encabezado detectado
+    if hasattr(archivo, "seek"):
+        archivo.seek(0)
     
-    hoja = _detectar_hoja(archivo, config["nombres_hoja"])
-    logger.info(f"   Hoja detectada: '{hoja}'")
-    
-    df = _leer_excel_con_header(archivo, hoja, config["fila_encabezado"])
-    logger.info(f"   Filas leídas: {len(df)} | Columnas: {len(df.columns)}")
-    
-    # Manejar columnas duplicadas: si hay dos 'BU', tomar la primera
-    df = df.loc[:, ~df.columns.duplicated(keep="first")]
-    
-    validar_columnas(df, "sea")
-    
-    df["BU"] = normalizar_texto(df["BU"])
-    df["Item Code"] = normalizar_texto(df["Item Code"])
-    df["Container Number"] = normalizar_texto(df["Container Number"])
-    df["Total Gross Weight"] = normalizar_numerico(df["Total Gross Weight"])
-    
-    df = eliminar_filas_vacias(df, ["Container Number", "Item Code"])
-    df = eliminar_filas_totales(df, "BU")
-    
-    if len(df) == 0:
-        raise DatosVaciosError("El archivo SEA no contiene datos válidos.")
-    
-    logger.info(f"✅ SEA cargado correctamente: {len(df)} registros válidos")
-    return df
-
-
-# ============================================================
-# FUNCIÓN: CARGAR LAND (🔧 CORREGIDA)
-# ============================================================
-def cargar_land(archivo) -> pd.DataFrame:
-    """
-    Carga el reporte LAND.
-    
-    🔧 FIX: El archivo tiene DOS columnas 'BU' (una real en E, otra en BV con 
-    Machine/Miscelaneus del proceso). Por eso leemos por POSICIÓN de columna:
-    
-    Estructura esperada:
-        - Hoja: 'land' (o variantes)
-        - Encabezado: fila 5
-        - Columnas a leer (por letra):
-            B  → Inbound/Outbound
-            C  → Method
-            D  → Reference
-            E  → BU              ← BU REAL (M19, M23, M45, M46, etc.)
-            AZ → Peso Bruto (Kgs)
-            BC → No. Parte Prov.
-    """
-    logger.info("📥 Cargando archivo LAND...")
-    config = CONFIG_HOJAS["land"]
-    
-    # 1. Detectar hoja
-    hoja = _detectar_hoja(archivo, config["nombres_hoja"])
-    logger.info(f"   Hoja detectada: '{hoja}'")
-    
-    # 2. Leer SOLO las columnas correctas por posición (evita conflicto con BV)
-    columnas_excel = ["B", "C", "D", "E", "AZ", "BC"]
-    nombres_finales = [
-        "Inbound/Outbound",
-        "Method",
-        "Reference",
-        "BU",
-        "Peso Bruto (Kgs)",
-        "No. Parte Prov.",
-    ]
-    
-    df = _leer_excel_por_posicion(
-        archivo, hoja, config["fila_encabezado"],
-        columnas_excel, nombres_finales
+    df = pd.read_excel(
+        archivo,
+        sheet_name=mejor_hoja["hoja"],
+        header=mejor_hoja["fila_header"],
+        dtype=object,
     )
-    logger.info(f"   Filas leídas: {len(df)} | Columnas: {len(df.columns)}")
-    logger.info(f"   Columnas asignadas: {list(df.columns)}")
+    df.columns = [str(c).strip() for c in df.columns]
     
-    # 3. Validar columnas
-    validar_columnas(df, "land")
+    logger.info(f"📥 Filas leídas: {len(df)} | Columnas: {len(df.columns)}")
     
-    # 4. Normalización
-    df["Inbound/Outbound"] = normalizar_texto(df["Inbound/Outbound"])
-    df["Method"] = normalizar_texto(df["Method"])
+    # 3. Mapear columnas con alias
+    df, mapeo, no_mapeadas = mapear_columnas_dataframe(df, operacion)
+    
+    # 4. Validar columnas críticas
+    es_valido, faltantes_crit, faltantes_opt = validar_columnas_criticas(df, operacion)
+    
+    if not es_valido:
+        raise ColumnaFaltanteError(faltantes_crit, operacion)
+    
+    if faltantes_opt:
+        logger.warning(f"   ⚠️ Columnas opcionales faltantes: {faltantes_opt}")
+    
+    info_lectura = {
+        "hoja_usada": mejor_hoja["hoja"],
+        "fila_header": mejor_hoja["fila_header"] + 1,
+        "columnas_mapeadas": mapeo,
+        "columnas_no_mapeadas": no_mapeadas,
+        "columnas_criticas_faltantes": faltantes_crit,
+        "columnas_opcionales_faltantes": faltantes_opt,
+        "filas_leidas": len(df),
+        "score_hoja": mejor_hoja["score"],
+        "todas_las_hojas": todas,
+    }
+    
+    return df, info_lectura
+
+
+# ============================================================
+# CARGAR LAND (versión tolerante)
+# ============================================================
+def cargar_land(archivo, hoja_forzada: Optional[str] = None) -> pd.DataFrame:
+    """
+    Carga el reporte LAND con detección automática de hoja y columnas.
+    
+    Args:
+        archivo: Archivo Excel
+        hoja_forzada: Opcional - si el usuario eligió una hoja manualmente
+    """
+    logger.info("=" * 60)
+    logger.info("📥 CARGANDO ARCHIVO LAND")
+    logger.info("=" * 60)
+    
+    df, info = _leer_hoja_tolerante(archivo, "land", hoja_forzada)
+    
+    # Normalización de columnas LÓGICAS
     df["Reference"] = normalizar_texto(df["Reference"])
-    df["BU"] = normalizar_texto(df["BU"])
-    df["Peso Bruto (Kgs)"] = normalizar_numerico(df["Peso Bruto (Kgs)"])
-    df["No. Parte Prov."] = normalizar_texto(df["No. Parte Prov."])
+    df["Peso Bruto"] = normalizar_numerico(df["Peso Bruto"])
+    df["Item"] = normalizar_texto(df["Item"])
     
-    # 5. Limpieza
-    df = eliminar_filas_vacias(df, ["Reference", "No. Parte Prov."])
+    # BU es opcional (puede no existir)
+    if "BU" in df.columns:
+        df["BU"] = normalizar_texto(df["BU"])
+    else:
+        df["BU"] = None  # Se inferirá del Reference
+        logger.info("   ℹ️ Columna BU no encontrada - se inferirá del Reference")
+    
+    # Columnas opcionales
+    for col_opc in ["Caja", "Method", "Cantidad", "Customer"]:
+        if col_opc in df.columns:
+            if col_opc == "Cantidad":
+                df[col_opc] = normalizar_numerico(df[col_opc])
+            else:
+                df[col_opc] = normalizar_texto(df[col_opc])
+    
+    # Limpieza
+    df = eliminar_filas_vacias(df, ["Reference", "Item"])
     df = eliminar_filas_totales(df, "Reference")
     
+    # Filtrar pesos válidos
+    df = df[df["Peso Bruto"].notna() & (df["Peso Bruto"] > 0)]
+    
     if len(df) == 0:
-        raise DatosVaciosError("El archivo LAND no contiene datos válidos.")
+        raise DatosVaciosError("El archivo LAND no contiene datos válidos después de limpieza.")
     
-    # 6. Log de validación: mostrar BUs detectados
-    bus_detectados = sorted(df["BU"].dropna().unique().tolist())
-    logger.info(f"   ✅ BUs detectados en LAND: {bus_detectados}")
+    # 🆕 ALIAS de retrocompatibilidad para no romper código existente
+    df["Peso Bruto (Kgs)"] = df["Peso Bruto"]
+    df["No. Parte Prov."] = df["Item"]
     
-    logger.info(f"✅ LAND cargado correctamente: {len(df)} registros válidos")
+    # Log final
+    bus = sorted(df["BU"].dropna().unique().tolist()) if df["BU"].notna().any() else []
+    logger.info(f"   ✅ BUs detectados (directos): {bus}")
+    logger.info(f"   ✅ References únicas: {df['Reference'].nunique()}")
+    logger.info(f"✅ LAND cargado: {len(df)} registros válidos")
+    
+    # Guardar info de lectura en el DataFrame (atributo)
+    df.attrs["info_lectura"] = info
+    
     return df
 
 
-def cargar_outbound(archivo) -> tuple:
+# ============================================================
+# CARGAR OUTBOUND (versión tolerante)
+# ============================================================
+def cargar_outbound(
+    archivo,
+    hoja_forzada: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
-    Carga el reporte OUTBOUND junto con su tabla de costos variables.
-    
-    🔧 ESTRUCTURA REAL:
-        Sección Extraction (datos): columnas BG-BO, fila 8
-        Tabla de costos:            columnas BC-BE, fila 8
+    Carga el reporte OUTBOUND y opcionalmente la tabla de costos variables.
     
     Returns:
-        tuple: (df_datos, df_costos)
-            - df_datos: DataFrame con los items
-            - df_costos: DataFrame con [Reference, Cost (USD), Fix Cost]
-              o None si no se encuentra la tabla
+        Tupla: (df_datos, df_costos)
     """
-    logger.info("📥 Cargando archivo OUTBOUND...")
-    config = CONFIG_HOJAS["outbound"]
+    logger.info("=" * 60)
+    logger.info("📥 CARGANDO ARCHIVO OUTBOUND")
+    logger.info("=" * 60)
     
-    hoja = _detectar_hoja(archivo, config["nombres_hoja"])
-    logger.info(f"   Hoja detectada: '{hoja}'")
-    
-    # ────────────────────────────────────────────────────────
-    # 1. CARGAR LA SECCIÓN EXTRACTION (DATOS)
-    # ────────────────────────────────────────────────────────
-    columnas_excel = ["BG", "BH", "BI", "BJ", "BK", "BL", "BM", "BN", "BO"]
-    nombres_finales = [
-        "Inbound/Outbound", "Method", "Reference",
-        "Customer", "ADDRESS", "BU",
-        "Item", "Qty Pzas", "Gross Weight",
-    ]
-    
-    fila_encabezado = config["fila_encabezado"]  # 8
-    
-    try:
-        df = _leer_excel_por_posicion(
-            archivo, hoja, fila_encabezado,
-            columnas_excel, nombres_finales
-        )
-        logger.info(f"   Filas leídas (Extraction): {len(df)}")
-    except Exception as e:
-        logger.warning(f"Lectura por posición falló: {e}")
-        df = _leer_excel_con_header(archivo, hoja, fila_encabezado)
-        df = df.loc[:, ~df.columns.duplicated(keep="last")]
-    
-    validar_columnas(df, "outbound")
+    df, info = _leer_hoja_tolerante(archivo, "outbound", hoja_forzada)
     
     # Normalización
-    df["Inbound/Outbound"] = normalizar_texto(df["Inbound/Outbound"])
-    df["Method"] = normalizar_texto(df["Method"])
     df["Reference"] = normalizar_texto(df["Reference"])
-    df["BU"] = normalizar_texto(df["BU"])
-    df["Gross Weight"] = normalizar_numerico(df["Gross Weight"])
+    df["Peso Bruto"] = normalizar_numerico(df["Peso Bruto"])
     df["Item"] = normalizar_texto(df["Item"])
-    df["Qty Pzas"] = normalizar_numerico(df["Qty Pzas"])
     
-    if "Customer" in df.columns:
-        df["Customer"] = normalizar_texto(df["Customer"])
-    if "ADDRESS" in df.columns:
-        df["ADDRESS"] = normalizar_texto(df["ADDRESS"])
+    if "BU" in df.columns:
+        df["BU"] = normalizar_texto(df["BU"])
+    else:
+        df["BU"] = None
     
+    for col_opc in ["Customer", "Method", "Container", "Cantidad"]:
+        if col_opc in df.columns:
+            if col_opc == "Cantidad":
+                df[col_opc] = normalizar_numerico(df[col_opc])
+            else:
+                df[col_opc] = normalizar_texto(df[col_opc])
+    
+    # Crear Waybill desde Reference si no existe
     if "Waybill Number" not in df.columns:
         df["Waybill Number"] = df["Reference"]
     
     df = eliminar_filas_vacias(df, ["Reference", "Item"])
     df = eliminar_filas_totales(df, "Reference")
+    df = df[df["Peso Bruto"].notna() & (df["Peso Bruto"] > 0)]
     
     if len(df) == 0:
         raise DatosVaciosError("El archivo OUTBOUND no contiene datos válidos.")
     
-    # ────────────────────────────────────────────────────────
-    # 2. 🆕 CARGAR LA TABLA DE COSTOS VARIABLES (BC:BE, fila 8)
-    # ────────────────────────────────────────────────────────
-    df_costos = _cargar_tabla_costos_outbound(archivo, hoja, fila_encabezado)
+    # Alias de retrocompatibilidad
+    df["Gross Weight"] = df["Peso Bruto"]
+    
+    # Cargar tabla de costos variables (opcional)
+    df_costos = _intentar_cargar_costos_outbound(archivo, info["hoja_usada"])
     
     if df_costos is not None and len(df_costos) > 0:
-        logger.info(f"   ✅ Tabla de costos cargada: {len(df_costos)} references")
-        total_fix_cost = df_costos["Fix Cost"].sum()
-        logger.info(f"   💰 Suma total Fix Cost: ${total_fix_cost:,.2f}")
-    else:
-        logger.warning("   ⚠️ No se encontró tabla de costos. Se usará costo fijo.")
+        logger.info(f"   💰 Tabla de costos cargada: {len(df_costos)} references")
     
-    # Logs finales
-    bus_directos = df["BU"].dropna().unique().tolist()
-    refs_unicos = df["Reference"].nunique()
-    logger.info(f"   ✅ References únicas: {refs_unicos}")
-    logger.info(f"   ✅ BUs: {sorted(bus_directos)}")
+    bus = sorted(df["BU"].dropna().unique().tolist()) if df["BU"].notna().any() else []
+    logger.info(f"   ✅ BUs directos: {bus}")
+    logger.info(f"   ✅ References únicas: {df['Reference'].nunique()}")
     logger.info(f"✅ OUTBOUND cargado: {len(df)} registros válidos")
     
+    df.attrs["info_lectura"] = info
     return df, df_costos
 
 
-def _cargar_tabla_costos_outbound(archivo, hoja: str, fila_encabezado: int):
-    """
-    🆕 Carga la tabla de costos variables del Outbound (columnas BC:BE).
-    
-    Estructura esperada (fila 8):
-        BC: Reference
-        BD: Cost (USD)        ← costo consumido (puede ser $0)
-        BE: Fix Cost          ← costo asignado/presupuestado ✅
-    
-    Returns:
-        DataFrame con [Reference, Cost (USD), Fix Cost] o None
-    """
+def _intentar_cargar_costos_outbound(archivo, hoja: str) -> Optional[pd.DataFrame]:
+    """Intenta cargar tabla de costos variables. Si no existe, devuelve None."""
     try:
-        df_costos = _leer_excel_por_posicion(
-            archivo, hoja, fila_encabezado,
-            columnas_excel=["BC", "BD", "BE"],
-            nombres_finales=["Reference", "Cost (USD)", "Fix Cost"],
-        )
+        if hasattr(archivo, "seek"):
+            archivo.seek(0)
         
-        # Limpieza
+        # Buscar columnas que contengan "Cost" o "Fix Cost"
+        df_raw = pd.read_excel(archivo, sheet_name=hoja, header=None, nrows=20, dtype=object)
+        
+        # Escanear todas las celdas buscando "Reference" + "Fix Cost"
+        fila_costos = None
+        for idx, row in df_raw.iterrows():
+            valores = [str(v).strip().lower() if pd.notna(v) else "" for v in row.values]
+            tiene_ref = any("reference" in v or "referencia" in v for v in valores)
+            tiene_fix = any("fix cost" in v or "fixcost" in v for v in valores)
+            if tiene_ref and tiene_fix:
+                fila_costos = idx
+                break
+        
+        if fila_costos is None:
+            return None
+        
+        # Releer con ese header
+        if hasattr(archivo, "seek"):
+            archivo.seek(0)
+        df_full = pd.read_excel(archivo, sheet_name=hoja, header=fila_costos, dtype=object)
+        df_full.columns = [str(c).strip() for c in df_full.columns]
+        
+        # Buscar las columnas relevantes
+        col_ref = None
+        col_cost = None
+        col_fix = None
+        for col in df_full.columns:
+            col_lower = col.lower()
+            if "reference" in col_lower and col_ref is None:
+                col_ref = col
+            elif col_lower in ("cost (usd)", "cost", "costo (usd)"):
+                col_cost = col
+            elif "fix cost" in col_lower or "fixcost" in col_lower:
+                col_fix = col
+        
+        if not col_ref or not col_fix:
+            return None
+        
+        df_costos = df_full[[col_ref, col_cost, col_fix] if col_cost else [col_ref, col_fix]].copy()
+        df_costos.columns = ["Reference", "Cost (USD)", "Fix Cost"] if col_cost else ["Reference", "Fix Cost"]
+        
         df_costos["Reference"] = normalizar_texto(df_costos["Reference"])
-        df_costos["Cost (USD)"] = normalizar_numerico(df_costos["Cost (USD)"])
         df_costos["Fix Cost"] = normalizar_numerico(df_costos["Fix Cost"])
+        if "Cost (USD)" in df_costos.columns:
+            df_costos["Cost (USD)"] = normalizar_numerico(df_costos["Cost (USD)"])
         
-        # Eliminar filas vacías o con Reference inválida
-        df_costos = df_costos.dropna(subset=["Reference"])
-        df_costos = df_costos[df_costos["Reference"].str.strip() != ""]
+        df_costos = df_costos.dropna(subset=["Reference", "Fix Cost"])
         df_costos = df_costos[df_costos["Fix Cost"] > 0]
         df_costos = df_costos.reset_index(drop=True)
         
         return df_costos if len(df_costos) > 0 else None
     
     except Exception as e:
-        logger.warning(f"No se pudo cargar tabla de costos: {e}")
+        logger.debug(f"   No se pudo cargar tabla de costos: {e}")
         return None
+
+
+# ============================================================
+# CARGAR SEA (versión tolerante)
+# ============================================================
+def cargar_sea(archivo, hoja_forzada: Optional[str] = None) -> pd.DataFrame:
+    """Carga el reporte SEA con detección automática."""
+    logger.info("=" * 60)
+    logger.info("📥 CARGANDO ARCHIVO SEA")
+    logger.info("=" * 60)
     
+    df, info = _leer_hoja_tolerante(archivo, "sea", hoja_forzada)
+    
+    df["Container"] = normalizar_texto(df["Container"])
+    df["Peso Bruto"] = normalizar_numerico(df["Peso Bruto"])
+    df["Item"] = normalizar_texto(df["Item"])
+    
+    if "BU" in df.columns:
+        df["BU"] = normalizar_texto(df["BU"])
+    else:
+        df["BU"] = None
+    
+    for col_opc in ["Subinventory", "Costo"]:
+        if col_opc in df.columns:
+            if col_opc == "Costo":
+                df[col_opc] = normalizar_numerico(df[col_opc])
+            else:
+                df[col_opc] = normalizar_texto(df[col_opc])
+    
+    df = eliminar_filas_vacias(df, ["Container", "Item"])
+    df = eliminar_filas_totales(df, "Container")
+    df = df[df["Peso Bruto"].notna() & (df["Peso Bruto"] > 0)]
+    
+    if len(df) == 0:
+        raise DatosVaciosError("El archivo SEA no contiene datos válidos.")
+    
+    # Alias retrocompatibilidad
+    df["Container Number"] = df["Container"]
+    df["Item Code"] = df["Item"]
+    df["Total Gross Weight"] = df["Peso Bruto"]
+    
+    bus = sorted(df["BU"].dropna().unique().tolist()) if df["BU"].notna().any() else []
+    logger.info(f"   ✅ BUs: {bus}")
+    logger.info(f"✅ SEA cargado: {len(df)} registros válidos")
+    
+    df.attrs["info_lectura"] = info
+    return df
+
+
 # ============================================================
 # METADATA
 # ============================================================
 def obtener_metadata(archivo) -> dict:
     """Retorna información general del archivo Excel."""
-    try:
-        if hasattr(archivo, "seek"):
-            archivo.seek(0)
-        wb = load_workbook(archivo, read_only=True, data_only=True)
-        metadata = {
-            "hojas": wb.sheetnames,
-            "total_hojas": len(wb.sheetnames),
-        }
-        wb.close()
-        return metadata
-    except Exception as e:
-        raise ArchivoInvalidoError(f"No se pudo leer metadata: {e}")
+    hojas = listar_hojas(archivo)
+    return {
+        "hojas": hojas,
+        "total_hojas": len(hojas),
+    }

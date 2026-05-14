@@ -6,11 +6,17 @@ import numpy as np
 from typing import Dict, Optional
 from dataclasses import dataclass, field
 
+
 from src.reglas.inferencia_bu import (
     inferir_bu_desde_reference,
     obtener_todos_los_bus,
 )
 from src.utils.logger import configurar_logger
+
+from src.reglas.regla_miscelaneus import (
+    aplicar_regla_miscelaneus,
+    cargar_config_miscelaneus,
+)
 
 logger = configurar_logger("procesar_outbound")
 
@@ -43,7 +49,31 @@ def procesar_outbound(
     columna_item: str = "Item",
     columna_qty: str = "Qty Pzas",
     columna_bu_directo: str = "BU",
+    
 ) -> ResultadoOutbound:
+    
+    logger.info("🔄 Aplicando regla Miscelaneus a Outbound...")
+
+    config_misc = cargar_config_miscelaneus()
+    df, reporte_miscelaneus = aplicar_regla_miscelaneus(
+        df,
+    columna_item=columna_item,                # "Item"
+    columna_bu_origen="BU (Asignado)",        # Usar el BU ya asignado
+    columna_bu_destino="BU Final",
+    palabras_sin_filtro=config_misc["palabras_sin_filtro"],
+    palabras_con_filtro_guion=config_misc["palabras_con_filtro_guion"],
+    bu_miscelaneus=config_misc["bu_destino"],
+    )
+
+    # Usar "BU Final" en lugar de "BU (Inferido)" para compatibilidad
+    df["BU (Inferido)"] = df["BU Final"]
+
+    # Agregar al reporte:
+    metricas["miscelaneus"] = {
+        "items_reasignados": reporte_miscelaneus["items_reasignados"],
+        "monto_reasignado": reporte_miscelaneus["monto_reasignado"],
+    }
+    
     """
     Procesa el reporte de exportaciones.
     

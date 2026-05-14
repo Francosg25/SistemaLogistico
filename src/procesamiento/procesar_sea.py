@@ -23,14 +23,12 @@ from src.procesamiento.capex_handler import (
     validar_contenedores_capex,
     es_item_capex,
 )
+from src.reglas.regla_miscelaneus import aplicar_regla_miscelaneus, cargar_config_miscelaneus
 from src.utils.logger import configurar_logger
 
 logger = configurar_logger("procesar_sea")
 
 
-# ============================================================
-# ESTRUCTURA DE RESULTADO
-# ============================================================
 @dataclass
 class ResultadoSea:
     """Contenedor de resultados del procesamiento SEA."""
@@ -147,6 +145,17 @@ def procesar_sea(
         )
         advertencias.append(msg)
         logger.warning(f"⚠️ {msg}")
+
+    config_misc = cargar_config_miscelaneus()
+    df, reporte_miscelaneus = aplicar_regla_miscelaneus(
+        df,
+        columna_item="Item Code",              # Columna de Item en Sea
+        columna_bu_origen="BU",
+        columna_bu_destino="BU Final",
+        palabras_sin_filtro=config_misc["palabras_sin_filtro"],
+        palabras_con_filtro_guion=config_misc["palabras_con_filtro_guion"],
+        bu_miscelaneus=config_misc["bu_destino"],
+    )
     
     # ─────────────────────────────────────────────────────────
     # 5. CALCULAR %POND Y COST PARA REGISTROS NORMALES

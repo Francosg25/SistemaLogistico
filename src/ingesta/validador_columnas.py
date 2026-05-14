@@ -32,17 +32,33 @@ COLUMNAS_OBLIGATORIAS = {
 }
 
 
+import pandas as pd
+from typing import List, Dict
+from src.ingesta.excepciones import ColumnaFaltanteError
+from src.ingesta.mapeo_columnas import (
+    validar_columnas_criticas,
+    COLUMNAS_POR_OPERACION,
+)
+
+
 def validar_columnas(df: pd.DataFrame, tipo_operacion: str) -> None:
-    tipo = tipo_operacion.lower()
-    if tipo not in COLUMNAS_OBLIGATORIAS:
-        raise ValueError(f"Tipo de operación desconocido: {tipo_operacion}")
+    """
+    Valida que el DataFrame tenga las columnas críticas para la operación.
+    Lanza ColumnaFaltanteError si falta alguna crítica.
+    """
+    es_valido, faltantes_crit, _ = validar_columnas_criticas(df, tipo_operacion.lower())
     
-    requeridas = COLUMNAS_OBLIGATORIAS[tipo]
-    columnas_df = [str(c).strip() for c in df.columns]
-    faltantes = [col for col in requeridas if col not in columnas_df]
-    
-    if faltantes:
-        raise ColumnaFaltanteError(faltantes, tipo_operacion)
+    if not es_valido:
+        raise ColumnaFaltanteError(faltantes_crit, tipo_operacion)
+
+
+def obtener_resumen_columnas(df: pd.DataFrame) -> Dict:
+    return {
+        "total_columnas": len(df.columns),
+        "columnas": list(df.columns),
+        "total_filas": len(df),
+        "filas_con_datos": int(df.notna().any(axis=1).sum()),
+    }
 
 
 def obtener_resumen_columnas(df: pd.DataFrame) -> Dict[str, any]:
