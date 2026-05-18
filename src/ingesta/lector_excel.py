@@ -193,6 +193,12 @@ def cargar_outbound(
     """
     Carga el reporte OUTBOUND y opcionalmente la tabla de costos variables.
     
+    🔧 v3 — Con diagnóstico y validación de integridad:
+      • Log claro de si df_costos viene cargado o vacío
+      • Advertencia si la cantidad de refs en costos no cuadra con datos
+      • Compatible con archivos que traen tabla embebida (EXCEL OUTBOUND.xlsx)
+        y archivos sin tabla (REPORTE EXPO W19.xlsx)
+    
     Returns:
         Tupla: (df_datos, df_costos)
     """
@@ -202,7 +208,9 @@ def cargar_outbound(
     
     df, info = _leer_hoja_tolerante(archivo, "outbound", hoja_forzada)
     
-    # Normalización
+    # ─────────────────────────────────────────────────────────
+    # NORMALIZACIÓN DE COLUMNAS CRÍTICAS
+    # ─────────────────────────────────────────────────────────
     df["Reference"] = normalizar_texto(df["Reference"])
     df["Peso Bruto"] = normalizar_numerico(df["Peso Bruto"])
     df["Item"] = normalizar_texto(df["Item"])
@@ -212,6 +220,9 @@ def cargar_outbound(
     else:
         df["BU"] = None
     
+    # ─────────────────────────────────────────────────────────
+    # COLUMNAS OPCIONALES
+    # ─────────────────────────────────────────────────────────
     for col_opc in ["Customer", "Method", "Container", "Cantidad"]:
         if col_opc in df.columns:
             if col_opc == "Cantidad":
@@ -219,10 +230,15 @@ def cargar_outbound(
             else:
                 df[col_opc] = normalizar_texto(df[col_opc])
     
-    # Crear Waybill desde Reference si no existe
+    # ─────────────────────────────────────────────────────────
+    # CREAR WAYBILL NUMBER DESDE REFERENCE SI NO EXISTE
+    # ─────────────────────────────────────────────────────────
     if "Waybill Number" not in df.columns:
         df["Waybill Number"] = df["Reference"]
     
+    # ─────────────────────────────────────────────────────────
+    # LIMPIEZA DE FILAS INVÁLIDAS
+    # ─────────────────────────────────────────────────────────
     df = eliminar_filas_vacias(df, ["Reference", "Item"])
     df = eliminar_filas_totales(df, "Reference")
     df = df[df["Peso Bruto"].notna() & (df["Peso Bruto"] > 0)]
@@ -233,84 +249,224 @@ def cargar_outbound(
     # Alias de retrocompatibilidad
     df["Gross Weight"] = df["Peso Bruto"]
     
-    # Cargar tabla de costos variables (opcional)
+    # ─────────────────────────────────────────────────────────
+    # 🆕 CARGAR TABLA DE COSTOS VARIABLES (CON LOGGING DIAGNÓSTICO)
+    # ─────────────────────────────────────────────────────────
     df_costos = _intentar_cargar_costos_outbound(archivo, info["hoja_usada"])
     
-    if df_costos is not None and len(df_costos) > 0:
-        logger.info(f"   💰 Tabla de costos cargada: {len(df_costos)} references")
+    # 🔍 CAPA 1: Logging diagnóstico para detectar bugs silenciosos
+    if df_costos is None:
+        logger.warning(
+            "   🚨 _intentar_cargar_costos_outbound devolvió None → "
+            "se usará costo default $1,500/Waybill. Esto puede ser INCORRECTO "
+            "si el archivo tiene tabla de costos embebida (cols BC:BE)."
+        )
+    elif len(df_costos) == 0:
+        logger.warning(
+            "   🚨 df_costos está VACÍO (0 filas) → "
+            "todos los waybills usarán default $1,500."
+        )
+    else:
+        total_costos = df_costos["Fix Cost"].sum()
+        n_refs_en_costos = df_costos["Reference"].nunique()
+        logger.info(
+            f"   ✅ df_costos cargado: {n_refs_en_costos} refs únicas | "
+            f"Total tabla=${total_costos:,.2f}"
+        )
     
+    # ─────────────────────────────────────────────────────────
+    # 📊 RESUMEN DE LECTURA
+    # ─────────────────────────────────────────────────────────
     bus = sorted(df["BU"].dropna().unique().tolist()) if df["BU"].notna().any() else []
     logger.info(f"   ✅ BUs directos: {bus}")
     logger.info(f"   ✅ References únicas: {df['Reference'].nunique()}")
     logger.info(f"✅ OUTBOUND cargado: {len(df)} registros válidos")
     
     df.attrs["info_lectura"] = info
+    
+    # ─────────────────────────────────────────────────────────
+    # 🆕 CAPA 3: VALIDACIÓN DE INTEGRIDAD (DENTRO de la función)
+    # ─────────────────────────────────────────────────────────
+    # Detecta el bug de "31 waybills × $1,500 = $46,500" antes de procesar
+    n_refs_datos = df["Reference"].nunique()
+    n_refs_costos = len(df_costos) if df_costos is not None else 0
+    
+    if n_refs_datos >= 10 and n_refs_costos < (n_refs_datos * 0.5):
+        logger.warning(
+            f"   ⚠️ POSIBLE BUG DETECTADO: {n_refs_datos} refs únicas en datos "
+            f"pero solo {n_refs_costos} en tabla de costos. Verifica la función "
+            f"_intentar_cargar_costos_outbound() — puede estar leyendo "
+            f"la columna 'Reference' incorrecta (col D en vez de col BC)."
+        )
+    elif n_refs_costos > 0 and n_refs_datos > 0:
+        cobertura = (n_refs_costos / n_refs_datos) * 100
+        logger.info(
+            f"   📊 Cobertura de tabla de costos: {n_refs_costos}/{n_refs_datos} "
+            f"refs ({cobertura:.0f}%)"
+        )
+    
     return df, df_costos
 
-
 def _intentar_cargar_costos_outbound(archivo, hoja: str) -> Optional[pd.DataFrame]:
-    """Intenta cargar tabla de costos variables. Si no existe, devuelve None."""
+    """
+    🔧 v3 — FIX DEFINITIVO para columnas duplicadas (3× 'Reference')
+    
+    Estrategia inmune a duplicados:
+      1. Lee la hoja con header=None (sin renombrar nada)
+      2. Busca filas que contengan AMBOS: 'Reference' Y 'Fix Cost'
+      3. Para cada 'Fix Cost', busca el 'Reference' ADYACENTE a la izquierda (máx 5 cols)
+      4. Extrae datos por POSICIÓN (df.iloc[:, pos]), NO por nombre
+      5. Si hay múltiples candidatos, elige el de mayor score (# refs únicas + suma)
+    """
     try:
         if hasattr(archivo, "seek"):
             archivo.seek(0)
         
-        # Buscar columnas que contengan "Cost" o "Fix Cost"
-        df_raw = pd.read_excel(archivo, sheet_name=hoja, header=None, nrows=20, dtype=object)
+        # ─── Paso 1: Leer RAW (sin headers) ───
+        df_raw = pd.read_excel(archivo, sheet_name=hoja, header=None, dtype=object)
         
-        # Escanear todas las celdas buscando "Reference" + "Fix Cost"
+        if len(df_raw) < 2:
+            return None
+        
+        # ─── Paso 2: Buscar fila con 'Reference' + 'Fix Cost' ───
         fila_costos = None
-        for idx, row in df_raw.iterrows():
-            valores = [str(v).strip().lower() if pd.notna(v) else "" for v in row.values]
-            tiene_ref = any("reference" in v or "referencia" in v for v in valores)
-            tiene_fix = any("fix cost" in v or "fixcost" in v for v in valores)
+        valores_fila = None
+        
+        for idx in range(min(20, len(df_raw))):
+            row_values = df_raw.iloc[idx].tolist()
+            valores_lower = [
+                str(v).strip().lower() if pd.notna(v) else ""
+                for v in row_values
+            ]
+            
+            tiene_ref = any(v in ("reference", "referencia") for v in valores_lower)
+            tiene_fix = any(v in ("fix cost", "fixcost") for v in valores_lower)
+            
             if tiene_ref and tiene_fix:
                 fila_costos = idx
+                valores_fila = valores_lower
+                logger.info(
+                    f"   🔍 Fila con Reference+Fix Cost: idx={idx} "
+                    f"(Excel row {idx + 1})"
+                )
                 break
         
         if fila_costos is None:
+            logger.info("   ℹ️ No se encontró fila con Reference + Fix Cost")
             return None
         
-        # Releer con ese header
-        if hasattr(archivo, "seek"):
-            archivo.seek(0)
-        df_full = pd.read_excel(archivo, sheet_name=hoja, header=fila_costos, dtype=object)
-        df_full.columns = [str(c).strip() for c in df_full.columns]
+        # ─── Paso 3: Localizar POSICIONES de Fix Cost y Reference adyacente ───
+        pos_fix_cost_list = [
+            i for i, v in enumerate(valores_fila)
+            if v in ("fix cost", "fixcost")
+        ]
         
-        # Buscar las columnas relevantes
-        col_ref = None
-        col_cost = None
-        col_fix = None
-        for col in df_full.columns:
-            col_lower = col.lower()
-            if "reference" in col_lower and col_ref is None:
-                col_ref = col
-            elif col_lower in ("cost (usd)", "cost", "costo (usd)"):
-                col_cost = col
-            elif "fix cost" in col_lower or "fixcost" in col_lower:
-                col_fix = col
-        
-        if not col_ref or not col_fix:
+        if not pos_fix_cost_list:
             return None
         
-        df_costos = df_full[[col_ref, col_cost, col_fix] if col_cost else [col_ref, col_fix]].copy()
-        df_costos.columns = ["Reference", "Cost (USD)", "Fix Cost"] if col_cost else ["Reference", "Fix Cost"]
+        pares_candidatos = []
+        for pos_fix in pos_fix_cost_list:
+            for offset in range(1, 6):  # máx 5 cols a la izquierda
+                pos_candidate = pos_fix - offset
+                if pos_candidate < 0:
+                    break
+                valor = valores_fila[pos_candidate]
+                if valor in ("reference", "referencia"):
+                    pares_candidatos.append((pos_candidate, pos_fix))
+                    logger.info(
+                        f"   📊 Par detectado: Reference@col{pos_candidate} + "
+                        f"Fix Cost@col{pos_fix}"
+                    )
+                    break
         
-        df_costos["Reference"] = normalizar_texto(df_costos["Reference"])
-        df_costos["Fix Cost"] = normalizar_numerico(df_costos["Fix Cost"])
-        if "Cost (USD)" in df_costos.columns:
-            df_costos["Cost (USD)"] = normalizar_numerico(df_costos["Cost (USD)"])
+        if not pares_candidatos:
+            logger.info("   ℹ️ Fix Cost encontrado pero sin Reference adyacente")
+            return None
         
-        df_costos = df_costos.dropna(subset=["Reference", "Fix Cost"])
-        df_costos = df_costos[df_costos["Fix Cost"] > 0]
-        df_costos = df_costos.reset_index(drop=True)
+        # ─── Paso 4: Probar cada par, elegir por score ───
+        mejor_df = None
+        mejor_score = 0
         
-        return df_costos if len(df_costos) > 0 else None
+        for pos_ref, pos_fix in pares_candidatos:
+            try:
+                # 🔑 EXTRAER POR POSICIÓN (índice) — inmune a duplicados
+                datos_ref = df_raw.iloc[fila_costos + 1:, pos_ref]
+                datos_fix = df_raw.iloc[fila_costos + 1:, pos_fix]
+                
+                df_cand = pd.DataFrame({
+                    "Reference": datos_ref.astype(str).str.strip(),
+                    "Fix Cost": pd.to_numeric(datos_fix, errors="coerce"),
+                })
+                
+                df_cand = df_cand.dropna(subset=["Fix Cost"])
+                df_cand = df_cand[df_cand["Reference"] != ""]
+                df_cand = df_cand[df_cand["Reference"].str.lower() != "nan"]
+                df_cand = df_cand[df_cand["Fix Cost"] > 0]
+                df_cand = df_cand.drop_duplicates(subset=["Reference"], keep="first")
+                df_cand = df_cand.reset_index(drop=True)
+                
+                if len(df_cand) == 0:
+                    continue
+                
+                n_refs = len(df_cand)
+                suma = float(df_cand["Fix Cost"].sum())
+                score = n_refs * 10 + (suma / 1000)
+                
+                logger.info(
+                    f"   📊 Par (ref={pos_ref}, fix={pos_fix}): "
+                    f"{n_refs} refs | Suma=${suma:,.2f} | Score={score:.0f}"
+                )
+                
+                if score > mejor_score:
+                    mejor_score = score
+                    mejor_df = df_cand
+            
+            except Exception as e:
+                logger.warning(f"   ⚠️ Par (ref={pos_ref}, fix={pos_fix}) falló: {e}")
+                continue
+        
+        if mejor_df is None or len(mejor_df) == 0:
+            return None
+        
+        total = float(mejor_df["Fix Cost"].sum())
+        logger.info(
+            f"   💰 Tabla de costos EMBEBIDA extraída: "
+            f"{len(mejor_df)} refs únicas | Total: ${total:,.2f}"
+        )
+
+           # ── 🛡️ BLINDAJE FINAL: garantizar que Fix Cost tenga valores REALES ──
+        # Reconfirmar tipos
+        mejor_df["Fix Cost"] = pd.to_numeric(mejor_df["Fix Cost"], errors="coerce")
+        mejor_df = mejor_df.dropna(subset=["Fix Cost"])
+        mejor_df = mejor_df[mejor_df["Fix Cost"] > 0]
+        mejor_df["Reference"] = mejor_df["Reference"].astype(str).str.strip()
+        
+        # Verificación crítica
+        suma_final = float(mejor_df["Fix Cost"].sum())
+        if suma_final <= 0:
+            logger.error(
+                f"   🚨 BLINDAJE ACTIVADO: Suma final = ${suma_final}. "
+                f"Devolviendo None para evitar corrupción."
+            )
+            return None
+        
+        # Forzar copia profunda para evitar referencias compartidas
+        mejor_df = mejor_df.reset_index(drop=True).copy(deep=True)
+        
+        logger.info(
+            f"   ✅ Blindaje OK: {len(mejor_df)} refs | Suma=${suma_final:,.2f}"
+        )
+        
+        return mejor_df
+
+
+        return mejor_df
     
     except Exception as e:
-        logger.debug(f"   No se pudo cargar tabla de costos: {e}")
+        logger.warning(f"   ⚠️ Error cargando tabla de costos: {e}")
         return None
 
-
+    
 # ============================================================
 # CARGAR SEA (versión tolerante)
 # ============================================================
