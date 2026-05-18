@@ -213,9 +213,6 @@ def renderizar() -> None:
             },
         )
 
-
-
-
         # ───────────────────────────────────────────────────
         # TABLA DE CONTENEDORES
         # ───────────────────────────────────────────────────
@@ -225,26 +222,6 @@ def renderizar() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
-
-        metricas = {
-            "total_contenedores": ...,
-            "total_items": ...,
-            "items_capex": ...,
-            "costo_total_calculado": ...,
-            "validacion_ok": ...,
-            "diferencia_validacion": ...,
-        # 🆕 AGREGAR ESTAS:
-        "bus_especiales": [
-            bu for bu in resumen_bu["BU"].tolist()
-            if bu in ("Capex", "MCS", "Miscelaneus", "Machine", "Sin Asignar")
-        ],
-        "bus_nuevos": [],  # Lista de BUs no estándar
-        "miscelaneus": {
-            "items_reasignados": reporte_miscelaneus.get("items_reasignados", 0),
-            "monto_reasignado": reporte_miscelaneus.get("monto_reasignado", 0.0),
-            "bus_origen": reporte_miscelaneus.get("bus_origen_reasignados", []),
-        },
-    }
 
         # ───────────────────────────────────────────────────
         # 🔄 SECCIÓN DE AUDITORÍA: Items reasignados a Miscelaneus

@@ -466,12 +466,17 @@ def _intentar_cargar_costos_outbound(archivo, hoja: str) -> Optional[pd.DataFram
         logger.warning(f"   ⚠️ Error cargando tabla de costos: {e}")
         return None
 
-    
-# ============================================================
-# CARGAR SEA (versión tolerante)
+ # ============================================================
+# CARGAR SEA (versión tolerante + auto-inferencia de BU)
 # ============================================================
 def cargar_sea(archivo, hoja_forzada: Optional[str] = None) -> pd.DataFrame:
-    """Carga el reporte SEA con detección automática."""
+    """
+    Carga el reporte SEA con detección automática.
+    
+    🆕 Auto-inferencia de BU:
+      Si la columna BU NO existe o viene vacía, se infiere automáticamente
+      desde MAESTRO_BU_SEA usando Item Code (con fallback por Subinventory).
+    """
     logger.info("=" * 60)
     logger.info("📥 CARGANDO ARCHIVO SEA")
     logger.info("=" * 60)
@@ -494,6 +499,29 @@ def cargar_sea(archivo, hoja_forzada: Optional[str] = None) -> pd.DataFrame:
             else:
                 df[col_opc] = normalizar_texto(df[col_opc])
     
+    # ═════════════════════════════════════════════════════════
+    # 🆕 AUTO-INFERIR BU DESDE MAESTRO_BU_SEA
+    # ═════════════════════════════════════════════════════════
+    try:
+        from src.reglas.inferir_bu_sea import inferir_bu_sea
+        
+        df, reporte_bu = inferir_bu_sea(
+            df,
+            columna_item="Item",            # En tu df se llama 'Item' (no 'Item Code')
+            columna_subinv="Subinventory",
+            columna_bu_destino="BU",
+            sobrescribir=False,  # Solo llena vacíos, respeta BU manual existente
+        )
+        df.attrs["reporte_bu_sea"] = reporte_bu
+        
+        if reporte_bu.get("sin_bu", 0) > 0:
+            logger.warning(
+                f"   ⚠️ {reporte_bu['sin_bu']} filas con SIN_BU. "
+                f"Cobertura: {reporte_bu.get('cobertura_pct', 0)}%"
+            )
+    except Exception as e:
+        logger.warning(f"   ⚠️ No se pudo inferir BU automáticamente: {e}")
+    
     df = eliminar_filas_vacias(df, ["Container", "Item"])
     df = eliminar_filas_totales(df, "Container")
     df = df[df["Peso Bruto"].notna() & (df["Peso Bruto"] > 0)]
@@ -512,7 +540,6 @@ def cargar_sea(archivo, hoja_forzada: Optional[str] = None) -> pd.DataFrame:
     
     df.attrs["info_lectura"] = info
     return df
-
 
 # ============================================================
 # METADATA

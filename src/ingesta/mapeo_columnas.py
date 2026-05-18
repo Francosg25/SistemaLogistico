@@ -21,8 +21,8 @@ logger = configurar_logger("mapeo_columnas")
 
 COLUMNAS_POR_OPERACION = {
     "sea": {
-        "criticas":   ["Container", "Item", "Peso Bruto", "BU"],
-        "opcionales": ["Cantidad", "Costo"],
+        "criticas":   ["Container", "Item", "Peso Bruto"],
+        "opcionales": ["Cantidad", "Costo", "BU"],
     },
     "land": {
         # 🔧 BU removido de críticas — se infiere desde 'Reference' (regex Mxx)
