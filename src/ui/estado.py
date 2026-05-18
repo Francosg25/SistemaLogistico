@@ -27,6 +27,9 @@ class Estado:
     # CAPEX manual
     CAPEX_MANUAL     = "capex_manual"
     
+    COSTOS_OUTBOUND_VARIABLES = "costos_outbound_variables"
+    NOMBRE_ARCH_OUTBOUND = "nombre_archivo_outbound"
+    
     # Comparación de BUs (Bloque 7)
     COMPARACION_BU   = "comparacion_bu"
     
@@ -59,8 +62,15 @@ def inicializar_estado() -> None:
         Estado.RES_SUMMARY:      None,
         Estado.REPORTE_VAL:      None,
         
-        # CAPEX
-        Estado.CAPEX_MANUAL:     pd.DataFrame(columns=["Container Number", "Item Code"]),
+        # CAPEX (Sea)
+        Estado.CAPEX_MANUAL:     pd.DataFrame(
+            columns=["Container Number", "Item Code"]
+        ),
+        
+        # 🆕 Costos variables Outbound (tabla vacía editable)
+        Estado.COSTOS_OUTBOUND_VARIABLES: pd.DataFrame(
+            columns=["Reference", "Fix Cost"]
+        ),
         
         # BUs
         Estado.COMPARACION_BU:   None,
@@ -96,18 +106,22 @@ def limpiar_todo() -> None:
     for clave in claves_a_limpiar:
         st.session_state[clave] = None
     
+    # Reset de tablas editables
     st.session_state[Estado.CAPEX_MANUAL] = pd.DataFrame(
         columns=["Container Number", "Item Code"]
+    )
+    st.session_state[Estado.COSTOS_OUTBOUND_VARIABLES] = pd.DataFrame(
+        columns=["Reference", "Fix Cost"]
     )
 
 
 def estado_procesamiento() -> dict:
     """Retorna el estado actual de procesamiento de cada operación."""
     return {
-        "sea":      st.session_state.get(Estado.RES_SEA) is not None,
-        "land":     st.session_state.get(Estado.RES_LAND) is not None,
-        "outbound": st.session_state.get(Estado.RES_OUTBOUND) is not None,
-        "summary":  st.session_state.get(Estado.RES_SUMMARY) is not None,
+        "sea":        st.session_state.get(Estado.RES_SEA) is not None,
+        "land":       st.session_state.get(Estado.RES_LAND) is not None,
+        "outbound":   st.session_state.get(Estado.RES_OUTBOUND) is not None,
+        "summary":    st.session_state.get(Estado.RES_SUMMARY) is not None,
         "validacion": st.session_state.get(Estado.REPORTE_VAL) is not None,
     }
 

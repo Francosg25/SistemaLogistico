@@ -1,22 +1,31 @@
 """
-Procesador de Exportaciones (OUTBOUND) - con soporte para costos variables.
+═══════════════════════════════════════════════════════════════
+PROCESADOR OUTBOUND (Exportaciones)
+═══════════════════════════════════════════════════════════════
+ORDEN DE OPERACIONES (CRÍTICO):
+  1. Compatibilidad de alias de columnas
+  2. Limpieza
+  3. Inferir BU desde el patrón del Waybill (SEGUNDO Mxx si hay 2)
+  4. 🔄 Aplicar regla Miscelaneus → crea 'BU Final'
+  5. Calcular %Proporción y Calc_Exp (usando costo variable o fijo)
+  6. Agrupar por 'BU Final'
+
+REGLA DEL BU (de PRORRATEO_EXPO!C4):
+  Calc_Exp = (Peso item / Peso total Waybill) × $1,500
+  BU extraído del patrón del Waybill (segundo BU si hay 2)
+═══════════════════════════════════════════════════════════════
 """
 import pandas as pd
 import numpy as np
+import re
 from typing import Dict, Optional
 from dataclasses import dataclass, field
-
-
-from src.reglas.inferencia_bu import (
-    inferir_bu_desde_reference,
-    obtener_todos_los_bus,
-)
-from src.utils.logger import configurar_logger
 
 from src.reglas.regla_miscelaneus import (
     aplicar_regla_miscelaneus,
     cargar_config_miscelaneus,
 )
+from src.utils.logger import configurar_logger
 
 logger = configurar_logger("procesar_outbound")
 
@@ -25,301 +34,366 @@ logger = configurar_logger("procesar_outbound")
 class ResultadoOutbound:
     detalle: pd.DataFrame
     resumen_bu: pd.DataFrame
-    referencias: pd.DataFrame
-    metricas: Dict[str, any] = field(default_factory=dict)
+    resumen_waybills: pd.DataFrame
+    metricas: Dict = field(default_factory=dict)
     advertencias: list = field(default_factory=list)
+    reporte_miscelaneus: Dict = field(default_factory=dict)
 
 
-def _asignar_bu_hibrido(row, columna_bu_directo: str = "BU", 
-                        columna_reference: str = "Reference"):
-    """Lógica híbrida: BU directo si existe, sino inferir del Reference."""
-    bu_directo = row.get(columna_bu_directo)
-    if bu_directo and isinstance(bu_directo, str) and bu_directo.strip():
-        return bu_directo.strip()
-    return inferir_bu_desde_reference(row.get(columna_reference, ""))
+# ════════════════════════════════════════════════════════════
+# FUNCIÓN: INFERIR BU DESDE EL WAYBILL NUMBER
+# ════════════════════════════════════════════════════════════
+def _inferir_bu_desde_waybill(waybill: str) -> str:
+    """
+    Extrae el BU del Waybill Number según la regla del negocio.
+    
+    Regla (de PRORRATEO_EXPO!C4):
+      • Si el Waybill contiene 2 BUs → tomar el SEGUNDO
+      • Si contiene 1 solo BU → tomarlo directo
+      • Si no encuentra BU → devolver 'SIN_BU'
+    
+    Examples:
+      'FG-R-2209LE26.M46/M45'  → 'M45'  (2 BUs → toma el 2°)
+      'FG-R-2215LE26.M01/M45'  → 'M45'  (2 BUs → toma el 2°)
+      'FG-R-2219LE26.M19'      → 'M19'  (1 BU → tomarlo directo)
+      'FG-R-2221LE26.M45'      → 'M45'  (1 BU → tomarlo directo)
+      'FG-R-2216LE26.M46/M45-2'→ 'M45'  (2 BUs con sufijo → toma el 2°)
+    """
+    if not isinstance(waybill, str):
+        return "SIN_BU"
+    
+    # Buscar TODOS los patrones Mxx (M seguido de 2 dígitos)
+    bus_encontrados = re.findall(r'M\d{2}', waybill.upper())
+    
+    if len(bus_encontrados) == 0:
+        return "SIN_BU"
+    elif len(bus_encontrados) == 1:
+        return bus_encontrados[0]
+    else:
+        # 🔑 Regla del negocio: tomar el SEGUNDO (índice 1)
+        return bus_encontrados[1]
 
 
+# ════════════════════════════════════════════════════════════
+# FUNCIÓN PRINCIPAL: PROCESAR OUTBOUND
+# ════════════════════════════════════════════════════════════
 def procesar_outbound(
     df_outbound: pd.DataFrame,
     costo_fijo: float = 1500.0,
-    df_costos: Optional[pd.DataFrame] = None,  # 🆕 Tabla de costos variables
-    columna_reference: str = "Reference",
-    columna_peso: str = "Gross Weight",
-    columna_waybill: str = "Waybill Number",
+    df_costos: Optional[pd.DataFrame] = None,
+    columna_waybill: str = "Reference",
+    columna_peso: str = "Peso Bruto",
     columna_item: str = "Item",
-    columna_qty: str = "Qty Pzas",
-    columna_bu_directo: str = "BU",
-    
+    columna_bu: str = "BU",
 ) -> ResultadoOutbound:
-    
-    logger.info("🔄 Aplicando regla Miscelaneus a Outbound...")
-
-    config_misc = cargar_config_miscelaneus()
-    df, reporte_miscelaneus = aplicar_regla_miscelaneus(
-        df,
-    columna_item=columna_item,                # "Item"
-    columna_bu_origen="BU (Asignado)",        # Usar el BU ya asignado
-    columna_bu_destino="BU Final",
-    palabras_sin_filtro=config_misc["palabras_sin_filtro"],
-    palabras_con_filtro_guion=config_misc["palabras_con_filtro_guion"],
-    bu_miscelaneus=config_misc["bu_destino"],
-    )
-
-    # Usar "BU Final" en lugar de "BU (Inferido)" para compatibilidad
-    df["BU (Inferido)"] = df["BU Final"]
-
-    # Agregar al reporte:
-    metricas["miscelaneus"] = {
-        "items_reasignados": reporte_miscelaneus["items_reasignados"],
-        "monto_reasignado": reporte_miscelaneus["monto_reasignado"],
-    }
-    
     """
-    Procesa el reporte de exportaciones.
-    
-    🆕 Si se proporciona df_costos, usa costos variables por Reference.
-    Si no, usa el costo_fijo para todos.
+    Procesa el reporte OUTBOUND aplicando prorrateo + regla Miscelaneus.
     
     Args:
-        df_outbound: DataFrame con los datos de outbound
-        costo_fijo: Costo default si no hay tabla de costos
-        df_costos: DataFrame opcional con [Reference, Fix Cost]
+        df_outbound: DataFrame del lector tolerante
+        costo_fijo: Costo default por Waybill (default $1,500)
+        df_costos: DataFrame opcional con costos variables por Waybill
+                   (columnas: Reference, Fix Cost)
+        columna_waybill: Nombre de la columna Waybill/Reference (default 'Reference')
+        columna_peso: Nombre de la columna Peso Bruto (default 'Peso Bruto')
+        columna_item: Nombre de la columna Item (default 'Item')
+        columna_bu: Nombre de la columna BU (default 'BU')
     """
     logger.info("=" * 60)
-    logger.info("📤 INICIANDO PROCESAMIENTO OUTBOUND")
-    
-    if df_costos is not None and len(df_costos) > 0:
-        logger.info("💰 Modo: COSTOS VARIABLES por Reference")
-    else:
-        logger.info(f"💰 Modo: COSTO FIJO ${costo_fijo:,.0f} para todas las references")
-    
+    logger.info("🚢 INICIANDO PROCESAMIENTO OUTBOUND")
     logger.info("=" * 60)
     
     # ─────────────────────────────────────────────────────────
-    # 1. VALIDACIONES INICIALES
+    # VALIDACIÓN INICIAL
     # ─────────────────────────────────────────────────────────
     if df_outbound is None or len(df_outbound) == 0:
         raise ValueError("El DataFrame de Outbound está vacío.")
     
     df = df_outbound.copy()
     advertencias = []
-    logger.info(f"📊 Registros recibidos: {len(df)}")
     
     # ─────────────────────────────────────────────────────────
-    # 2. LIMPIEZA
+    # PASO 0: COMPATIBILIDAD DE NOMBRES DE COLUMNAS (alias legacy)
+    # ─────────────────────────────────────────────────────────
+    # Reference: puede venir como 'Waybill Number' (legacy)
+    if columna_waybill not in df.columns and "Waybill Number" in df.columns:
+        df[columna_waybill] = df["Waybill Number"]
+        logger.info("   🔄 'Waybill Number' promovido a 'Reference' (alias)")
+    
+    # Peso: puede venir como 'Gross Weight' o 'Gross Weight (Kgs)'
+    if columna_peso not in df.columns:
+        for alias in ["Gross Weight", "Gross Weight (Kgs)", "Peso Bruto (Kgs)"]:
+            if alias in df.columns:
+                df[columna_peso] = df[alias]
+                logger.info(f"   🔄 '{alias}' promovido a '{columna_peso}' (alias)")
+                break
+    
+    # Item: puede venir con varios nombres
+    if columna_item not in df.columns:
+        for alias in ["Item Code", "PN", "No. Parte Prov."]:
+            if alias in df.columns:
+                df[columna_item] = df[alias]
+                logger.info(f"   🔄 '{alias}' promovido a '{columna_item}' (alias)")
+                break
+    
+    logger.info(f"📊 Registros recibidos: {len(df)}")
+    logger.info(f"   Columnas disponibles (primeras 15): {list(df.columns)[:15]}")
+    
+    # ─────────────────────────────────────────────────────────
+    # PASO 1: LIMPIEZA
     # ─────────────────────────────────────────────────────────
     filas_antes = len(df)
-    df = df.dropna(subset=[columna_reference])
-    df = df[df[columna_reference].astype(str).str.strip() != ""]
+    
+    # Verificar que las columnas críticas existan (BU NO es crítica — se infiere)
+    columnas_criticas = [columna_waybill, columna_peso, columna_item]
+    faltantes = [c for c in columnas_criticas if c not in df.columns]
+    if faltantes:
+        raise ValueError(
+            f"Columnas críticas faltantes en Outbound: {faltantes}. "
+            f"Columnas disponibles: {list(df.columns)}"
+        )
+    
+    # Limpiar filas inválidas
+    df = df.dropna(subset=[columna_waybill])
+    df = df[df[columna_waybill].astype(str).str.strip() != ""]
     df[columna_peso] = pd.to_numeric(df[columna_peso], errors="coerce")
     df = df.dropna(subset=[columna_peso])
     df = df[df[columna_peso] > 0]
     
     filas_descartadas = filas_antes - len(df)
     if filas_descartadas > 0:
-        advertencias.append(f"Se descartaron {filas_descartadas} filas")
-        logger.warning(f"⚠️ Filas descartadas: {filas_descartadas}")
+        msg = f"Se descartaron {filas_descartadas} filas (sin Waybill o peso inválido)"
+        advertencias.append(msg)
+        logger.warning(f"⚠️ {msg}")
     
     if len(df) == 0:
         raise ValueError(
-            "Todos los registros fueron descartados. "
-            "Verifica encabezados y datos del archivo."
+            "Todos los registros de OUTBOUND fueron descartados. "
+            "Verifica que las columnas Waybill, Peso Bruto e Item existan."
         )
     
     # ─────────────────────────────────────────────────────────
-    # 3. ASIGNACIÓN HÍBRIDA DE BU
+    # PASO 2: INFERIR BU DESDE EL WAYBILL (regla del SEGUNDO BU)
     # ─────────────────────────────────────────────────────────
-    df["BU (Asignado)"] = df.apply(
-        lambda row: _asignar_bu_hibrido(row, columna_bu_directo, columna_reference),
-        axis=1
-    )
-    
-    def _metodo(row):
-        bu_dir = row.get(columna_bu_directo, "")
-        if bu_dir and isinstance(bu_dir, str) and bu_dir.strip():
-            return "Directo (columna BU)"
-        elif row.get("BU (Asignado)"):
-            return "Inferido (del Reference)"
-        return "Sin asignar"
-    
-    df["Método BU"] = df.apply(_metodo, axis=1)
-    metodos_count = df["Método BU"].value_counts().to_dict()
-    
-    df["Todos los BU"] = df[columna_reference].apply(
-        lambda x: "/".join(obtener_todos_los_bus(x))
-    )
-    
-    # Filtrar sin BU
-    sin_bu = df[df["BU (Asignado)"].isna() | (df["BU (Asignado)"] == "")]
-    if len(sin_bu) > 0:
-        advertencias.append(f"{len(sin_bu)} filas sin BU asignado")
-        df = df[~(df["BU (Asignado)"].isna() | (df["BU (Asignado)"] == ""))]
-    
-    if len(df) == 0:
-        raise ValueError("No se pudo asignar BU a ningún registro.")
-    
-    bus_unicos = df["BU (Asignado)"].dropna().unique().tolist()
-    logger.info(f"   ✅ BUs detectados: {sorted(bus_unicos)}")
-    
-    # ─────────────────────────────────────────────────────────
-    # 4. 🆕 ASIGNAR COSTO POR REFERENCE (VARIABLE O FIJO)
-    # ─────────────────────────────────────────────────────────
-    logger.info("💰 Asignando costo por Reference...")
-    
-    if df_costos is not None and len(df_costos) > 0:
-        # Modo VARIABLE: hacer merge con la tabla de costos
-        df_costos_limpio = df_costos[["Reference", "Fix Cost"]].copy()
-        df_costos_limpio = df_costos_limpio.drop_duplicates(subset=["Reference"])
-        
-        df = df.merge(
-            df_costos_limpio,
-            on="Reference",
-            how="left",
-            suffixes=("", "_costo")
+    if columna_bu not in df.columns:
+        logger.info("   🧠 Columna 'BU' no existe → infiriendo desde Waybill Number")
+        df[columna_bu] = df[columna_waybill].apply(_inferir_bu_desde_waybill)
+    else:
+        # Si existe pero tiene nulos, inferir solo los faltantes
+        mask_nulos = (
+            df[columna_bu].isna()
+            | (df[columna_bu].astype(str).str.strip() == "")
         )
-        
-        # Si alguna Reference no aparece en la tabla, usar costo_fijo como fallback
-        references_sin_costo = df[df["Fix Cost"].isna()][columna_reference].unique().tolist()
-        if references_sin_costo:
-            advertencias.append(
-                f"{len(references_sin_costo)} References sin costo en tabla. "
-                f"Usando ${costo_fijo:,.0f} como fallback: {references_sin_costo[:3]}..."
+        if mask_nulos.any():
+            n_nulos = mask_nulos.sum()
+            logger.info(f"   🧠 Infiriendo BU para {n_nulos} filas con BU vacío")
+            df.loc[mask_nulos, columna_bu] = df.loc[mask_nulos, columna_waybill].apply(
+                _inferir_bu_desde_waybill
             )
-            logger.warning(f"   ⚠️ {len(references_sin_costo)} refs sin costo asignado")
-        
-        df["Fix Cost"] = df["Fix Cost"].fillna(costo_fijo)
-        
-        # Estadísticas
-        costos_unicos = df_costos_limpio["Fix Cost"].nunique()
-        logger.info(f"   📊 Costos variables aplicados ({costos_unicos} valores únicos)")
-        logger.info(f"   💵 Rango: ${df['Fix Cost'].min():,.0f} - ${df['Fix Cost'].max():,.0f}")
+    
+    # Fallback final: cualquier BU vacío → 'Sin Asignar'
+    df[columna_bu] = df[columna_bu].fillna("Sin Asignar")
+    df.loc[df[columna_bu].astype(str).str.strip() == "", columna_bu] = "Sin Asignar"
+    
+    bus_originales = sorted(df[columna_bu].dropna().unique().tolist())
+    logger.info(f"   ✅ BUs detectados: {bus_originales}")
+    
+    # ─────────────────────────────────────────────────────────
+    # PASO 3: APLICAR REGLA MISCELANEUS (crea 'BU Final')
+    # ─────────────────────────────────────────────────────────
+    logger.info("🔄 Aplicando regla Miscelaneus...")
+    
+    config_misc = cargar_config_miscelaneus()
+    df, reporte_miscelaneus = aplicar_regla_miscelaneus(
+        df,
+        columna_item=columna_item,
+        columna_bu_origen=columna_bu,
+        columna_bu_destino="BU Final",
+        palabras_sin_filtro=config_misc["palabras_sin_filtro"],
+        palabras_con_filtro_guion=config_misc["palabras_con_filtro_guion"],
+        bu_miscelaneus=config_misc["bu_destino"],
+    )
+    
+    # Verificación defensiva: si la regla no creó la columna, copiarla
+    if "BU Final" not in df.columns:
+        logger.warning("⚠️ 'BU Final' no se creó. Copiando desde 'BU'.")
+        df["BU Final"] = df[columna_bu]
+    
+    if reporte_miscelaneus.get("items_reasignados", 0) > 0:
+        logger.info(
+            f"   ✅ {reporte_miscelaneus['items_reasignados']} items reasignados a "
+            f"'{reporte_miscelaneus['bu_destino']}'"
+        )
     else:
-        # Modo FIJO
-        df["Fix Cost"] = costo_fijo
-        logger.info(f"   💵 Costo fijo: ${costo_fijo:,.0f}")
+        logger.info("   ℹ️ Sin items reasignados a Miscelaneus")
     
     # ─────────────────────────────────────────────────────────
-    # 5. CÁLCULO DE %PROPORTION Y CALC_EXP
+    # PASO 4: APLICAR COSTOS VARIABLES (si existen)
     # ─────────────────────────────────────────────────────────
-    logger.info("🧮 Calculando %Proportion y Calc_Exp...")
+    logger.info("💰 Aplicando costos por Waybill...")
     
-    df["Peso Total Reference"] = df.groupby(columna_reference)[columna_peso].transform("sum")
-    df["%Proportion"] = df[columna_peso] / df["Peso Total Reference"]
-    df["%Proportion"] = df["%Proportion"].fillna(0)
-    df["Calc_Exp"] = df["%Proportion"] * df["Fix Cost"]
+    # Inicializar Fix Cost con el costo fijo default
+    df["Fix Cost"] = costo_fijo
     
-    # ─────────────────────────────────────────────────────────
-    # 6. DETALLE
-    # ─────────────────────────────────────────────────────────
-    df["BU (Inferido)"] = df["BU (Asignado)"]
-    
-    columnas_detalle = [
-        col for col in [
-            "Inbound/Outbound", "Method", columna_reference,
-            "BU (Inferido)", "Método BU", "Todos los BU",
-            columna_waybill, columna_item, columna_qty,
-            columna_peso, "Peso Total Reference",
-            "%Proportion", "Fix Cost", "Calc_Exp",
-        ] if col in df.columns
-    ]
-    detalle = df[columnas_detalle].copy().reset_index(drop=True)
-    
-    # ─────────────────────────────────────────────────────────
-    # 7. TABLA DE REFERENCIAS
-    # ─────────────────────────────────────────────────────────
-    referencias = (
-        df.groupby(columna_reference)
-        .agg(**{
-            "BU Asignado": ("BU (Inferido)", lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else None),
-            "Todos los BU": ("Todos los BU", "first"),
-            "# Items": (columna_item, "count"),
-            "Peso Total (Kgs)": (columna_peso, "sum"),
-            "Fix Cost": ("Fix Cost", "first"),
-            "Total Calculado": ("Calc_Exp", "sum"),
-        })
-        .reset_index()
-    )
-    
-    # ─────────────────────────────────────────────────────────
-    # 8. RESUMEN POR BU
-    # ─────────────────────────────────────────────────────────
-    resumen_bu = (
-        df.dropna(subset=["BU (Inferido)"])
-        .groupby("BU (Inferido)")
-        .agg(**{
-            "Log. Exp (USD)": ("Calc_Exp", "sum"),
-            "# References": (columna_reference, "nunique"),
-            "# Items": (columna_item, "count"),
-            "Peso Total (Kgs)": (columna_peso, "sum"),
-        })
-        .reset_index()
-        .rename(columns={"BU (Inferido)": "BU"})
-    )
-    
-    total_exp = resumen_bu["Log. Exp (USD)"].sum()
-    resumen_bu["%PCT"] = resumen_bu["Log. Exp (USD)"] / total_exp if total_exp > 0 else 0.0
-    resumen_bu = resumen_bu.sort_values("Log. Exp (USD)", ascending=False).reset_index(drop=True)
-    
-    # ─────────────────────────────────────────────────────────
-    # 9. MÉTRICAS
-    # ─────────────────────────────────────────────────────────
-    num_referencias = referencias[columna_reference].nunique()
-    
-    # 🆕 Costo total esperado depende del modo
     if df_costos is not None and len(df_costos) > 0:
-        # Suma de Fix Cost por reference única
-        refs_en_datos = df[columna_reference].unique()
-        df_costos_relevantes = df_costos[df_costos["Reference"].isin(refs_en_datos)]
-        costo_total_esperado = df_costos_relevantes["Fix Cost"].sum()
-        # Sumar también las refs sin costo (usando fallback)
-        refs_con_fallback = [r for r in refs_en_datos if r not in df_costos_relevantes["Reference"].values]
-        costo_total_esperado += len(refs_con_fallback) * costo_fijo
-        modo_costo = "variable"
+        mapa_costos = dict(zip(
+            df_costos["Reference"].astype(str),
+            df_costos["Fix Cost"],
+        ))
+        
+        df["Fix Cost"] = (
+            df[columna_waybill]
+            .astype(str)
+            .map(mapa_costos)
+            .fillna(costo_fijo)
+        )
+        
+        n_variables = int((df["Fix Cost"] != costo_fijo).sum())
+        logger.info(f"   ✅ {n_variables} filas con costo variable aplicado")
     else:
-        costo_total_esperado = num_referencias * costo_fijo
-        modo_costo = "fijo"
+        logger.info(f"   ℹ️ Sin tabla de costos variables. Usando default: ${costo_fijo}")
     
-    costo_total_calculado = detalle["Calc_Exp"].sum()
-    diferencia = abs(costo_total_esperado - costo_total_calculado)
+    # ─────────────────────────────────────────────────────────
+    # PASO 5: CALCULAR %PROPORCIÓN Y CALC_EXP
+    # ─────────────────────────────────────────────────────────
+    logger.info("🧮 Calculando %Proporción y Calc_Exp...")
+    
+    df["Peso Total Waybill"] = df.groupby(columna_waybill)[columna_peso].transform("sum")
+    df["%Proporcion"] = df[columna_peso] / df["Peso Total Waybill"]
+    df["%Proporcion"] = df["%Proporcion"].fillna(0)
+    df["Calc_Exp"] = df["%Proporcion"] * df["Fix Cost"]
+    
+    # Alias para retrocompatibilidad con código antiguo / Summary
+    df["Amount"] = df["Calc_Exp"]
+    
+    # ─────────────────────────────────────────────────────────
+    # PASO 6: RESUMEN POR BU FINAL
+    # ─────────────────────────────────────────────────────────
+    logger.info("📊 Generando resumen por BU Final...")
+    
+    resumen_bu = (
+        df.groupby("BU Final")
+        .agg(
+            **{
+                "Monto Total (USD)": ("Calc_Exp", "sum"),
+                "# Waybills":        (columna_waybill, "nunique"),
+                "# Items":           (columna_item, "count"),
+                "Peso Total (Kgs)":  (columna_peso, "sum"),
+            }
+        )
+        .reset_index()
+        .rename(columns={"BU Final": "BU"})
+    )
+    
+    total_monto = resumen_bu["Monto Total (USD)"].sum()
+    resumen_bu["%PCT"] = (
+        resumen_bu["Monto Total (USD)"] / total_monto if total_monto > 0 else 0.0
+    )
+    resumen_bu = (
+        resumen_bu
+        .sort_values("Monto Total (USD)", ascending=False)
+        .reset_index(drop=True)
+    )
+    
+    # ─────────────────────────────────────────────────────────
+    # PASO 7: RESUMEN POR WAYBILL
+    # ─────────────────────────────────────────────────────────
+    resumen_waybills = (
+        df.groupby(columna_waybill)
+        .agg(
+            **{
+                "BU Asignado": (
+                    "BU Final",
+                    lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else "Sin Asignar"
+                ),
+                "# Items":          (columna_item, "count"),
+                "Peso Total (Kgs)": (columna_peso, "sum"),
+                "Fix Cost":         ("Fix Cost", "first"),
+                "Total Amount":     ("Calc_Exp", "sum"),
+            }
+        )
+        .reset_index()
+        .rename(columns={columna_waybill: "Waybill Number"})
+    )
+    
+    # ─────────────────────────────────────────────────────────
+    # PASO 8: MÉTRICAS (con todas las claves para compatibilidad UI)
+    # ─────────────────────────────────────────────────────────
+    num_waybills = df[columna_waybill].nunique()
+    
+    # Costo esperado = suma de Fix Cost únicos por Waybill
+    costo_esperado = (
+        df.groupby(columna_waybill)["Fix Cost"]
+        .first()
+        .sum()
+    )
+    
+    costo_calculado = df["Calc_Exp"].sum()
+    diferencia = abs(costo_esperado - costo_calculado)
+    
+    # Detectar modo de costo (variable vs default)
+    waybills_con_costo_variable = int(
+        df.groupby(columna_waybill)["Fix Cost"]
+        .first()
+        .ne(costo_fijo)
+        .sum()
+    )
+    
+    modo_costo = "variable" if waybills_con_costo_variable > 0 else "default"
+    n_waybills_variables = waybills_con_costo_variable
     
     metricas = {
-        "total_items": len(detalle),
-        "total_references": num_referencias,
-        "total_bus": len(bus_unicos),
-        "bus_detectados": sorted(bus_unicos),
-        "metodos_asignacion": metodos_count,
-        "modo_costo": modo_costo,  # 🆕
-        "costo_fijo_por_reference": costo_fijo if modo_costo == "fijo" else None,
-        "costo_total_esperado": round(costo_total_esperado, 2),
-        "costo_total_calculado": round(costo_total_calculado, 2),
-        "diferencia_validacion": round(diferencia, 2),
-        "validacion_ok": diferencia < 1.0,  # Tolerancia mayor por redondeos
-        "filas_descartadas": filas_descartadas,
+        # ──── Métricas básicas ────
+        "total_items":            len(df),
+        "total_waybills":         num_waybills,
+        "total_bus":              len(resumen_bu),
+        "bus_detectados":         resumen_bu["BU"].tolist(),
+        "costo_fijo_default":     costo_fijo,
+        "costo_total_esperado":   round(costo_esperado, 2),
+        "costo_total_calculado":  round(costo_calculado, 2),
+        "diferencia_validacion":  round(diferencia, 2),
+        "validacion_ok":          diferencia < 1.0,
+        "filas_descartadas":      filas_descartadas,
+        
+        # ──── Modo costo (Outbound-only) ────
+        "modo_costo":             modo_costo,
+        "n_waybills_variables":   n_waybills_variables,
+        "n_waybills_default":     num_waybills - n_waybills_variables,
+        
+        # ──── BUs especiales / nuevos ────
+        "bus_especiales": [
+            bu for bu in resumen_bu["BU"].tolist()
+            if bu in ("Miscelaneus", "Machine", "Capex", "MCS", "Sin Asignar")
+        ],
+        "bus_nuevos": [],
+        
+        # ──── Reporte Miscelaneus ────
+        "miscelaneus": {
+            "items_reasignados": reporte_miscelaneus.get("items_reasignados", 0),
+            "monto_reasignado":  reporte_miscelaneus.get("monto_reasignado", 0.0),
+            "bus_origen":        reporte_miscelaneus.get("bus_origen_reasignados", []),
+        },
     }
     
     # ─────────────────────────────────────────────────────────
-    # 10. LOG FINAL
+    # PASO 9: LOG FINAL
     # ─────────────────────────────────────────────────────────
     logger.info("─" * 60)
     logger.info(f"✅ Items procesados:       {metricas['total_items']}")
-    logger.info(f"✅ References únicos:      {metricas['total_references']}")
-    logger.info(f"✅ BUs detectados:         {metricas['total_bus']} → {metricas['bus_detectados']}")
-    logger.info(f"💰 Modo de costo:          {metricas['modo_costo'].upper()}")
-    logger.info(f"💰 Costo total esperado:   ${metricas['costo_total_esperado']:,.2f}")
-    logger.info(f"💰 Costo total calculado:  ${metricas['costo_total_calculado']:,.2f}")
-    logger.info(f"🔍 Diferencia:             ${metricas['diferencia_validacion']:,.4f}")
-    
-    if metricas["validacion_ok"]:
-        logger.info("✅ VALIDACIÓN: Conservación de costo OK")
-    else:
-        logger.warning(f"⚠️ Diferencia: ${metricas['diferencia_validacion']:.2f}")
-    
+    logger.info(f"✅ Waybills únicos:        {metricas['total_waybills']}")
+    logger.info(f"✅ BUs en resumen:         {metricas['total_bus']} → {metricas['bus_detectados']}")
+    logger.info(f"💰 Costo esperado:         ${metricas['costo_total_esperado']:,.2f}")
+    logger.info(f"💰 Costo calculado:        ${metricas['costo_total_calculado']:,.2f}")
+    logger.info(f"💵 Modo costo:             {metricas['modo_costo']}")
+    logger.info(f"🔄 Items reasignados:      {metricas['miscelaneus']['items_reasignados']}")
+    logger.info(f"✅ Validación OK:          {metricas['validacion_ok']}")
     logger.info("=" * 60)
     
     return ResultadoOutbound(
-        detalle=detalle,
+        detalle=df,
         resumen_bu=resumen_bu,
-        referencias=referencias,
+        resumen_waybills=resumen_waybills,
         metricas=metricas,
         advertencias=advertencias,
+        reporte_miscelaneus=reporte_miscelaneus,
     )

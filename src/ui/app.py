@@ -12,6 +12,8 @@ from src.ui.pestanias import (
     pestania_validaciones,
 )
 
+inicializar_estado()
+
 
 
 st.set_page_config(

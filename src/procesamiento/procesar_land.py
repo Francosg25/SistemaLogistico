@@ -16,6 +16,7 @@ import re
 from typing import Dict, Optional
 from dataclasses import dataclass, field
 
+from src.reglas.inferencia_bu import inferir_bu_desde_reference
 from src.reglas.regla_miscelaneus import (
     aplicar_regla_miscelaneus,
     cargar_config_miscelaneus,
@@ -35,24 +36,32 @@ class ResultadoLand:
     reporte_miscelaneus: Dict = field(default_factory=dict)
 
 
-def _inferir_bu_desde_reference(reference: str) -> Optional[str]:
-    """
-    Infiere el BU desde el patrón del Reference.
-    Ejemplos:
-        'RM-J-1325LI26-M19'           → 'M19'
-        'RM-J-1359LI26-M23.CS1037'    → 'M23'
-        'RM-J-1381LI26-M00'           → 'M00'
-    """
-    if not isinstance(reference, str) or not reference.strip():
-        return None
-    
-    # Patrón: -Mxx donde xx son 2 dígitos
-    match = re.search(r"-M(\d{2})", reference.upper())
-    if match:
-        return f"M{match.group(1)}"
-    
-    return None
 
+def _inferir_bu_desde_referencia(referencia: str) -> str:
+    """
+    Extrae el BU del campo 'Referencia' en archivos LAND.
+    
+    Regla LAND (diferente a Outbound):
+      • Buscar el PRIMER patrón Mxx (M seguido de 2 dígitos) en la referencia
+      • Ignorar sufijos después del punto o guion
+      • Si no encuentra → 'SIN_BU'
+    
+    Examples:
+      'RM-J-1359LI26-M23.CS1037' → 'M23'  (primer match)
+      'RM-J-1361LI26-M19'        → 'M19'  (primer match)
+      'RM-J-1377LI26-M19.2'      → 'M19'  (ignora .2)
+      'RM-J-1381LI26-M00'        → 'M00'  (M00 es válido)
+      'RM-J-1390LI26-M23'        → 'M23'  (primer match)
+    """
+    if not isinstance(referencia, str):
+        return "SIN_BU"
+    
+    # Buscar el primer patrón Mxx (M seguido de 2 dígitos)
+    match = re.search(r'M\d{2}', referencia.upper())
+    
+    if match:
+        return match.group(0)
+    return "SIN_BU"
 
 def procesar_land(
     df_land: pd.DataFrame,
@@ -73,6 +82,38 @@ def procesar_land(
         raise ValueError("El DataFrame de Land está vacío.")
     
     df = df_land.copy()
+    
+   
+    columna_referencia = "Reference"  # nombre lógico mapeado
+    columna_bu = "BU"
+    
+    if columna_bu not in df.columns:
+        logger.info("   🧠 Columna 'BU' no existe → infiriendo desde 'Referencia' (regex Mxx)")
+        if columna_referencia in df.columns:
+            df[columna_bu] = df[columna_referencia].apply(_inferir_bu_desde_referencia)
+            bus_inferidos = sorted(df[columna_bu].dropna().unique().tolist())
+            logger.info(f"   ✅ BUs inferidos: {bus_inferidos}")
+        else:
+            raise ValueError(
+                "No se puede inferir BU: falta también la columna 'Referencia/Reference'"
+            )
+    else:
+        # Si existe pero tiene nulos, inferir solo los faltantes
+        mask_nulos = (
+            df[columna_bu].isna()
+            | (df[columna_bu].astype(str).str.strip() == "")
+        )
+        if mask_nulos.any() and columna_referencia in df.columns:
+            n_nulos = mask_nulos.sum()
+            logger.info(f"   🧠 Infiriendo BU para {n_nulos} filas con BU vacío")
+            df.loc[mask_nulos, columna_bu] = df.loc[mask_nulos, columna_referencia].apply(
+                _inferir_bu_desde_referencia
+            )
+    
+    # Fallback final
+    df[columna_bu] = df[columna_bu].fillna("Sin Asignar")
+    df.loc[df[columna_bu].astype(str).str.strip() == "", columna_bu] = "Sin Asignar"
+    
     advertencias = []
     
     # ─────────────────────────────────────────────────────────
@@ -114,14 +155,14 @@ def procesar_land(
     # ─────────────────────────────────────────────────────────
     if columna_bu not in df.columns:
         logger.info("   ℹ️ Columna 'BU' no existe en archivo - infiriendo del Reference")
-        df[columna_bu] = df[columna_reference].apply(_inferir_bu_desde_reference)
+        df[columna_bu] = df[columna_reference].apply(inferir_bu_desde_reference)
     else:
         # Si existe pero tiene nulos, intentar inferir
         mask_nulos = df[columna_bu].isna() | (df[columna_bu].astype(str).str.strip() == "")
         if mask_nulos.any():
             logger.info(f"   ℹ️ Infiriendo BU para {mask_nulos.sum()} filas con BU nulo")
             df.loc[mask_nulos, columna_bu] = df.loc[mask_nulos, columna_reference].apply(
-                _inferir_bu_desde_reference
+                inferir_bu_desde_reference
             )
     
     # Si después de inferir aún hay nulos, marcar como 'Sin Asignar'

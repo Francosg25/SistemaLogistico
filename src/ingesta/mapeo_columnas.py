@@ -1,156 +1,193 @@
 """
 ═══════════════════════════════════════════════════════════════
-SISTEMA DE ALIAS DE COLUMNAS
+MAPEO DE COLUMNAS — Sistema tolerante de alias
 ═══════════════════════════════════════════════════════════════
-Permite que el sistema acepte múltiples nombres para la misma
-columna lógica (case-insensitive, sin acentos, sin espacios extra).
-
-Ejemplo:
-    Si el archivo tiene "Referencia", "Ref" o "Reference Number"
-    → todas se mapean a la columna lógica "Reference"
+🔧 v3 — Fix definitivo para columnas duplicadas:
+  1. Pre-renombra duplicados ANTES de cualquier operación
+  2. Convierte explícitamente a int/float (no Series)
+  3. Maneja DataFrames con columnas con el mismo nombre
 ═══════════════════════════════════════════════════════════════
 """
-import re
-import unicodedata
-from typing import Dict, List, Optional, Tuple
 import pandas as pd
+from typing import Optional, Dict, List, Tuple
+from collections import Counter
 
 from src.utils.logger import configurar_logger
 
 logger = configurar_logger("mapeo_columnas")
 
 
-# ════════════════════════════════════════════════════════════
-# DICCIONARIO DE ALIAS — Replica la Sección 10 de REGLAS_PROCESO
-# ════════════════════════════════════════════════════════════
-ALIAS_COLUMNAS = {
-    "Reference": [
-        "reference", "ref", "referencia", "# ref", "reference number",
-        "waybill", "waybill number", "no ref", "no. ref", "numero referencia",
-    ],
-    "BU": [
-        "bu", "business unit", "b.u.", "b u", "unidad de negocio",
-        "fix bu", "bu final", "bu detectado",
-    ],
-    "Peso Bruto": [
-        "peso bruto (kgs)", "peso bruto kgs", "peso bruto", "gross weight",
-        "weight", "peso", "total gross weight", "peso bruto kg",
-        "gross weight (kgs)", "kg", "kgs",
-    ],
-    "Item": [
-        "item", "item code", "no. parte", "no parte", "no. parte prov.",
-        "no parte prov", "part number", "pn", "descripcion parte prov.",
-        "descripcion parte", "no. parte prov", "no.parte prov", "no. pte. impo",
-    ],
-    "Container": [
-        "container", "container number", "# container", "contenedor",
-        "no contenedor", "no. contenedor",
-    ],
-    "Customer": [
-        "customer", "cliente", "nombre cliente", "customer name",
-        "client", "razon social",
-    ],
-    "Cantidad": [
-        "qty", "qty pzas", "cantidad", "pieces", "bultos", "piezas",
-        "qty piezas", "quantity",
-    ],
-    "Costo": [
-        "cost", "cost (usd)", "fix cost", "container cost", "amount",
-        "monto", "costo", "costo (usd)", "amount (usd)", "monto (usd)",
-    ],
-    "Inbound/Outbound": [
-        "inbound/outbound", "in/out", "direction", "tipo", "tipo movimiento",
-        "movimiento",
-    ],
-    "Method": [
-        "method", "modo", "transport method", "transporte", "metodo",
-        "metodo transporte",
-    ],
-    "Subinventory": [
-        "subinventory", "sub inv", "sub-inventory", "inventario",
-        "almacen", "almacén",
-    ],
-    "Caja": [
-        "caja", "caja scan", "box", "carton",
-    ],
-}
 
 
-# ════════════════════════════════════════════════════════════
-# COLUMNAS REQUERIDAS / OPCIONALES por operación
-# ════════════════════════════════════════════════════════════
 COLUMNAS_POR_OPERACION = {
+    "sea": {
+        "criticas":   ["Container", "Item", "Peso Bruto", "BU"],
+        "opcionales": ["Cantidad", "Costo"],
+    },
     "land": {
-        "criticas": ["Reference", "Peso Bruto", "Item"],
-        "opcionales": ["BU", "Caja", "Method", "Cantidad"],
+        # 🔧 BU removido de críticas — se infiere desde 'Reference' (regex Mxx)
+        "criticas":   ["Reference", "Item", "Peso Bruto"],
+        "opcionales": ["Cantidad", "Costo", "Customer", "BU"],
     },
     "outbound": {
-        "criticas": ["Reference", "Peso Bruto", "Item"],
-        "opcionales": ["BU", "Customer", "Method", "Cantidad", "Container"],
-    },
-    "sea": {
-        "criticas": ["Container", "Peso Bruto", "Item"],
-        "opcionales": ["BU", "Subinventory", "Costo"],
+        # 🔧 BU removido de críticas — se infiere desde Waybill (2° BU si hay 2)
+        "criticas":   ["Reference", "Item", "Peso Bruto"],
+        "opcionales": ["Cantidad", "Customer", "Container", "BU"],
     },
 }
 
-
-# ════════════════════════════════════════════════════════════
-# FUNCIONES DE NORMALIZACIÓN
-# ════════════════════════════════════════════════════════════
-def normalizar_nombre_columna(nombre: str) -> str:
-    """
-    Normaliza un nombre de columna para comparación robusta:
-    - Convierte a minúsculas
-    - Quita acentos
-    - Reemplaza múltiples espacios por uno
-    - Quita espacios al inicio/fin
-    - Quita caracteres no alfanuméricos al inicio/fin
-    
-    Ejemplos:
-        "  Reference Number  " → "reference number"
-        "Peso Bruto (Kgs)"     → "peso bruto (kgs)"
-        "REFERENCIA"           → "referencia"
-    """
-    if nombre is None:
-        return ""
-    
-    s = str(nombre).strip().lower()
-    
-    # Quitar acentos
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    
-    # Normalizar espacios
-    s = re.sub(r"\s+", " ", s)
-    s = s.strip()
-    
-    return s
+ALIAS_COLUMNAS = {
+    "Reference": [
+        # 🔑 Waybill primero: es el más completo cuando hay duplicados
+        "waybill number",
+        "waybill",
+        "reference",
+        "ref",
+        "referencia",
+        "# ref",
+        "reference number",
+        "no ref", "no. ref", "numero referencia",
+    ],
+    "BU": [
+        "bu",
+        "business unit",
+        "fix bu",
+        "bu final",
+    ],
+    "Peso Bruto": [
+        "peso bruto (kgs)",
+        "gross weight (kgs)",
+        "gross weight",
+        "peso bruto",
+        "total gross weight",
+        "weight",
+        "peso",
+    ],
+    "Item": [
+        "no. parte prov.",
+        "no parte prov",
+        "item code",
+        "item",
+        "pn",
+        "part number",
+        "no. de parte",
+    ],
+    "Cantidad": [
+        "qty pzas",
+        "qty",
+        "cantidad",
+        "pieces",
+        "shipped quantity",
+        "total requested quantity",
+    ],
+    "Container": [
+        "container number",
+        "container",
+        "no. contenedor",
+        "contenedor",
+    ],
+    "Costo": [
+        "cost (usd)",
+        "fix cost",
+        "cost",
+        "costo",
+        "amount (usd)",
+        "amount",
+    ],
+    "Customer": [
+        "customer",
+        "cliente",
+        "customer name",
+    ],
+    "Method": [
+        "method",
+        "metodo",
+    ],
+    "Inbound/Outbound": [
+        "inbound/outbound",
+        "tipo",
+    ],
+}
 
 
 def buscar_columna_logica(nombre_real: str) -> Optional[str]:
     """
-    Dado un nombre de columna del archivo, devuelve la columna lógica
-    correspondiente (o None si no se reconoce).
-    
-    Ejemplos:
-        buscar_columna_logica("Referencia")     → "Reference"
-        buscar_columna_logica("gross weight")   → "Peso Bruto"
-        buscar_columna_logica("Mi Columna XYZ") → None
+    Dado un nombre real de columna, busca a qué columna lógica corresponde.
     """
-    if not nombre_real:
+    if not isinstance(nombre_real, str):
         return None
     
-    nombre_norm = normalizar_nombre_columna(nombre_real)
+    nombre_norm = nombre_real.strip().lower()
     if not nombre_norm:
         return None
     
-    for columna_logica, aliases in ALIAS_COLUMNAS.items():
+    for col_logica, aliases in ALIAS_COLUMNAS.items():
         for alias in aliases:
-            if normalizar_nombre_columna(alias) == nombre_norm:
-                return columna_logica
-    
+            if nombre_norm == alias.lower():
+                return col_logica
     return None
+
+
+def _renombrar_duplicados_pre_mapeo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    🔧 CAPA 1: Pre-renombra columnas duplicadas con sufijos __dup1, __dup2.
+    
+    Esto garantiza que df.columns sean ÚNICAS antes de cualquier operación,
+    evitando que df['col'] devuelva un DataFrame.
+    """
+    cols_actuales = list(df.columns)
+    contador = Counter()
+    nuevas_cols = []
+    
+    for col in cols_actuales:
+        col_str = str(col)
+        contador[col_str] += 1
+        if contador[col_str] == 1:
+            nuevas_cols.append(col_str)
+        else:
+            nuevo_nombre = f"{col_str}__dup{contador[col_str] - 1}"
+            nuevas_cols.append(nuevo_nombre)
+            logger.info(
+                f"   🔁 Pre-renombrado: '{col_str}' (duplicado #{contador[col_str]-1}) "
+                f"→ '{nuevo_nombre}'"
+            )
+    
+    df_renombrado = df.copy()
+    df_renombrado.columns = nuevas_cols
+    return df_renombrado
+
+
+def _calcular_score_columna(serie: pd.Series) -> float:
+    """
+    🔧 CAPA 2: Calcula el score de calidad de una columna.
+    Devuelve SIEMPRE un float (nunca Series).
+    """
+    try:
+        # Validar que sea Series (no DataFrame)
+        if isinstance(serie, pd.DataFrame):
+            # Si llega un DataFrame, tomar primera columna
+            serie = serie.iloc[:, 0]
+        
+        # Contar no nulos (garantizar int)
+        n_no_vacios = int(serie.notna().sum())
+        
+        # Longitud promedio de valores no nulos
+        try:
+            valores_str = serie.dropna().astype(str)
+            if len(valores_str) > 0:
+                longitud_promedio = float(valores_str.str.len().mean())
+            else:
+                longitud_promedio = 0.0
+        except Exception:
+            longitud_promedio = 0.0
+        
+        # Score final: SIEMPRE float
+        score = float(n_no_vacios * 100 + longitud_promedio)
+        return score
+    
+    except Exception as e:
+        logger.warning(f"   ⚠️ Error calculando score: {e}")
+        return 0.0
 
 
 def mapear_columnas_dataframe(
@@ -160,107 +197,194 @@ def mapear_columnas_dataframe(
     """
     Mapea las columnas reales del DataFrame a columnas lógicas.
     
-    Args:
-        df: DataFrame con nombres de columna del archivo
-        operacion: 'land', 'outbound' o 'sea' (para validar críticas)
-    
-    Returns:
-        Tupla:
-          - df_renombrado: DataFrame con columnas lógicas
-          - mapeo: dict {col_real: col_logica}
-          - columnas_no_mapeadas: lista de columnas que no se reconocieron
+    Con manejo robusto de duplicados:
+    1. Pre-renombra duplicados con __dup1, __dup2 (garantiza unicidad)
+    2. Calcula score por columna (garantiza float, no Series)
+    3. Elige la mejor candidata por col_logica
     """
-    mapeo = {}
-    no_mapeadas = []
+    # ─── CAPA 1: Pre-renombrar duplicados ───
+    df = _renombrar_duplicados_pre_mapeo(df)
+    
+    # ─── Detectar candidatas por columna lógica ───
+    # {col_logica: [(col_real, score), ...]}
+    candidatas: Dict[str, List[Tuple[str, float]]] = {}
+    no_mapeadas: List[str] = []
     
     for col_real in df.columns:
-        col_logica = buscar_columna_logica(col_real)
-        if col_logica:
-            # Si ya existe esta columna lógica (duplicado), agregar sufijo
-            if col_logica in mapeo.values():
-                contador = 2
-                while f"{col_logica}_{contador}" in mapeo.values():
-                    contador += 1
-                mapeo[col_real] = f"{col_logica}_{contador}"
-                logger.warning(
-                    f"   ⚠️ Columna duplicada: '{col_real}' → '{col_logica}_{contador}' "
-                    f"(ya existía '{col_logica}')"
-                )
-            else:
-                mapeo[col_real] = col_logica
-        else:
-            no_mapeadas.append(col_real)
+        # Buscar a qué col_logica corresponde
+        # Quitar sufijo __dupX para buscar el alias original
+        col_para_buscar = str(col_real).split("__dup")[0]
+        col_logica = buscar_columna_logica(col_para_buscar)
+        
+        if col_logica is None:
+            no_mapeadas.append(str(col_real))
+            continue
+        
+        # 🔧 CAPA 2: Garantizar que df[col_real] sea Series
+        try:
+            serie = df[col_real]
+            if isinstance(serie, pd.DataFrame):
+                # Tomar primera columna si por algún motivo es DataFrame
+                serie = serie.iloc[:, 0]
+        except Exception as e:
+            logger.warning(f"   ⚠️ No se pudo acceder a columna '{col_real}': {e}")
+            continue
+        
+        # Calcular score (devuelve float garantizado)
+        score = _calcular_score_columna(serie)
+        
+        if col_logica not in candidatas:
+            candidatas[col_logica] = []
+        candidatas[col_logica].append((str(col_real), score))
     
-    # Renombrar
+    # ─── Elegir la mejor candidata por col_logica ───
+    mapeo: Dict[str, str] = {}
+    duplicadas_descartadas: List[Tuple[str, str, float]] = []
+    
+    for col_logica, lista in candidatas.items():
+        # 🔧 CAPA 3: Sort seguro (score es float garantizado)
+        try:
+            lista.sort(key=lambda x: -float(x[1]))
+        except Exception as e:
+            logger.warning(f"   ⚠️ Error ordenando candidatas de '{col_logica}': {e}")
+            continue
+        
+        # Ganadora
+        ganadora_real, ganadora_score = lista[0]
+        mapeo[ganadora_real] = col_logica
+        
+        # Las otras → renombrar como _2, _3
+        for i, (col_real, score) in enumerate(lista[1:], start=2):
+            nombre_alt = f"{col_logica}_{i}"
+            mapeo[col_real] = nombre_alt
+            duplicadas_descartadas.append((col_real, col_logica, score))
+            logger.info(
+                f"   📋 Duplicado: '{col_real}' (score={score:.0f}) "
+                f"perdió vs '{ganadora_real}' (score={ganadora_score:.0f}) "
+                f"→ renombrado a '{nombre_alt}'"
+            )
+    
+    # ─── Renombrar el DataFrame ───
     df_renombrado = df.rename(columns=mapeo)
     
-    # Logging
     if mapeo:
         logger.info(f"🗂️ Columnas mapeadas: {len(mapeo)}")
-        for real, logica in mapeo.items():
-            if real != logica:
-                logger.debug(f"   '{real}' → '{logica}'")
-    
     if no_mapeadas:
         logger.info(f"   ℹ️ Columnas no reconocidas (se ignoran): {len(no_mapeadas)}")
+    if duplicadas_descartadas:
+        logger.info(f"   ⚠️ Duplicados resueltos: {len(duplicadas_descartadas)}")
     
     return df_renombrado, mapeo, no_mapeadas
 
 
+# ════════════════════════════════════════════════════════════
+# HELPERS DE VALIDACIÓN
+# ════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+# HELPERS DE VALIDACIÓN
+# ════════════════════════════════════════════════════════════
 def validar_columnas_criticas(
     df: pd.DataFrame,
-    operacion: str,
+    operacion: Optional[str] = None,
 ) -> Tuple[bool, List[str], List[str]]:
     """
-    Valida que el DataFrame tenga las columnas críticas para la operación.
+    Valida que las columnas críticas estén presentes en el DataFrame.
+    
+    🔧 v2 — Devuelve 3 valores (compatible con lector_excel.py):
+        - es_valido: bool, True si todas las críticas están presentes
+        - faltantes_criticas: list, columnas críticas que faltan
+        - faltantes_opcionales: list, columnas opcionales que faltan (info)
+    
+    Args:
+        df: DataFrame con columnas YA MAPEADAS (lógicas)
+        operacion: 'sea', 'land' u 'outbound'
     
     Returns:
-        Tupla:
-          - es_valido: True si tiene todas las críticas
-          - faltantes_criticas: lista de columnas críticas faltantes
-          - faltantes_opcionales: lista de columnas opcionales faltantes
+        Tupla (es_valido, faltantes_criticas, faltantes_opcionales)
     """
-    if operacion not in COLUMNAS_POR_OPERACION:
-        return True, [], []
+    # Obtener configuración de la operación
+    config = COLUMNAS_POR_OPERACION.get(
+        (operacion or "").lower(),
+        {"criticas": ["Reference", "Item", "Peso Bruto"], "opcionales": []}
+    )
     
-    config = COLUMNAS_POR_OPERACION[operacion]
-    columnas_presentes = set(df.columns)
+    # Soportar formato dict (nuevo) y lista (legacy)
+    if isinstance(config, dict):
+        criticas = config.get("criticas", [])
+        opcionales = config.get("opcionales", [])
+    elif isinstance(config, list):
+        criticas = config
+        opcionales = []
+    else:
+        criticas = []
+        opcionales = []
     
-    faltantes_criticas = [
-        c for c in config["criticas"] if c not in columnas_presentes
-    ]
-    faltantes_opcionales = [
-        c for c in config["opcionales"] if c not in columnas_presentes
-    ]
+    # Detectar faltantes
+    faltantes_criticas = [c for c in criticas if c not in df.columns]
+    faltantes_opcionales = [c for c in opcionales if c not in df.columns]
     
     es_valido = len(faltantes_criticas) == 0
+    
+    if faltantes_criticas:
+        logger.warning(
+            f"   ⚠️ Faltan columnas críticas para '{operacion}': {faltantes_criticas}"
+        )
+    if faltantes_opcionales:
+        logger.info(
+            f"   ℹ️ Columnas opcionales no encontradas: {faltantes_opcionales}"
+        )
+    
     return es_valido, faltantes_criticas, faltantes_opcionales
 
+def calcular_score_hoja(
+    df: pd.DataFrame,
+    operacion: Optional[str] = None,
+    columnas_criticas: Optional[List[str]] = None,
+) -> Dict:
+    """
+    Calcula un score de qué tan probable es que una hoja sea la correcta
+    para una operación (sea/land/outbound).
+    
+    Args:
+        df: DataFrame con las columnas YA MAPEADAS (lógicas)
+        operacion: 'sea', 'land' u 'outbound'
+        columnas_criticas: Lista opcional de columnas críticas a buscar
+    
+    Returns:
+        Dict con score, presentes, faltantes, n_filas, n_criticas_total
+    """
+    # Lee del dict COLUMNAS_POR_OPERACION si no se especifica
+    if columnas_criticas is None:
+        config_operacion = COLUMNAS_POR_OPERACION.get(
+            (operacion or "").lower(),
+            {"criticas": ["Reference", "Item", "Peso Bruto"]}
+        )
+        # 🔧 FIX: Esta línea va DENTRO del if (4 espacios más)
+        columnas_criticas = config_operacion.get("criticas", [])
+    
+    # Detectar qué columnas críticas están presentes
+    presentes = [c for c in columnas_criticas if c in df.columns]
+    faltantes = [c for c in columnas_criticas if c not in df.columns]
+    
+    # Cálculo del score
+    # +10 por cada columna crítica presente
+    # +1 por cada fila con datos (bonus por tamaño, max 30)
+    score_columnas = len(presentes) * 10
+    score_filas = min(len(df), 30)  # max 30 puntos por filas
+    score_total = score_columnas + score_filas
+    
+    return {
+        "score": score_total,
+        "presentes": presentes,
+        "faltantes": faltantes,
+        "n_filas": len(df),
+        "n_criticas_total": len(columnas_criticas),
+        "n_criticas_presentes": len(presentes),
+    }
 
-def calcular_score_hoja(df: pd.DataFrame, operacion: str) -> int:
+def columnas_logicas_disponibles() -> List[str]:
     """
-    Calcula un score numérico de qué tan probable es que esta hoja
-    pertenezca a la operación indicada.
-    
-    Score:
-      +10 por cada columna crítica presente
-      +3 por cada columna opcional presente
-      -5 si faltan TODAS las críticas
+    Devuelve la lista de columnas lógicas que el sistema reconoce.
+    Útil para diagnóstico y documentación.
     """
-    if operacion not in COLUMNAS_POR_OPERACION:
-        return 0
-    
-    config = COLUMNAS_POR_OPERACION[operacion]
-    columnas_presentes = set(df.columns)
-    
-    score = 0
-    criticas_presentes = sum(1 for c in config["criticas"] if c in columnas_presentes)
-    opcionales_presentes = sum(1 for c in config["opcionales"] if c in columnas_presentes)
-    
-    score += criticas_presentes * 10
-    score += opcionales_presentes * 3
-    
-    if criticas_presentes == 0:
-        score -= 5
-    
-    return score
+    return list(ALIAS_COLUMNAS.keys())
