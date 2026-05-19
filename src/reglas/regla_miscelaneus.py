@@ -1,230 +1,263 @@
 """
 ═══════════════════════════════════════════════════════════════
-REGLA MISCELANEUS - Reasignación de BU para items plásticos
+REGLA MISCELANEUS — Reasignación de items plásticos
 ═══════════════════════════════════════════════════════════════
+Aplica reglas de palabras clave para reclasificar items con
+contenido plástico al BU "Miscelaneus".
 
-Replica EXACTAMENTE la fórmula Excel:
-    =IF(OR(
-        ISNUMBER(SEARCH("PLASTIC", item)),
-        ISNUMBER(SEARCH("CHAROLA", item)),
-        AND(ISNUMBER(SEARCH("TAPA",  item)), NOT(ISNUMBER(SEARCH("-", item)))),
-        AND(ISNUMBER(SEARCH("BASE",  item)), NOT(ISNUMBER(SEARCH("-", item)))),
-        AND(ISNUMBER(SEARCH("CAJA",  item)), NOT(ISNUMBER(SEARCH("-", item))))
-    ), "Miscelaneus", bu_original)
+Lee configuración desde config.yaml (NO hardcode).
 
-LÓGICA:
-  • Si el nombre del item contiene "PLASTIC"  → Miscelaneus
-  • Si el nombre del item contiene "CHAROLA"  → Miscelaneus
-  • Si contiene "TAPA" Y NO contiene guion    → Miscelaneus
-  • Si contiene "BASE" Y NO contiene guion    → Miscelaneus
-  • Si contiene "CAJA" Y NO contiene guion    → Miscelaneus
-  • Caso contrario                            → conservar BU original
+🔑 LÓGICA:
+  - palabras_sin_filtro:        SIEMPRE Miscelaneus (sin importar guion)
+  - palabras_con_filtro_guion:  SOLO si NO hay guion antes (evita SKUs)
 
-El guion '-' funciona como filtro anti-falso-positivo:
-  ✅ "BASE PLASTICA"      → Miscelaneus (sin guion, plástico)
-  ✅ "CAJA CARTON"        → Miscelaneus (sin guion)
-  ❌ "BASE-1200005"       → NO se reasigna (tiene guion, es código)
-  ❌ "0070-1200005"       → NO se reasigna (es código de parte)
+🔄 COMPATIBILIDAD HACIA ATRÁS:
+  - cargar_config_miscelaneus() → para procesar_outbound/sea/land legacy
+  - aplicar_regla_miscelaneus() → con firma extendida (params opcionales)
+  - es_miscelaneus()            → API simple para tests
 ═══════════════════════════════════════════════════════════════
 """
+import re
 import pandas as pd
-from typing import List, Dict, Optional, Tuple
-from src.utils.logger import configurar_logger
+from typing import Optional, List, Tuple, Dict, Any
 
-logger = configurar_logger("regla_miscelaneus")
-
-
-# ════════════════════════════════════════════════════════════
-# CONFIGURACIÓN DEFAULT (sobreescribible desde config.yaml)
-# ════════════════════════════════════════════════════════════
-PALABRAS_SIN_FILTRO = [
-    "PLASTIC",   # cualquier item con PLASTIC (PLASTICA, PLASTICO, PLASTICS)
-    "CHAROLA",   # CHAROLA PLASTICA, CHAROLAS, etc.
-]
-
-PALABRAS_CON_FILTRO_GUION = [
-    "TAPA",      # TAPA PLASTICA → SÍ ; TAPA-1234 → NO
-    "BASE",      # BASE PLASTICA → SÍ ; BASE-5678 → NO
-    "CAJA",      # CAJAS PLASTICAS → SÍ ; CAJA-XYZ → NO
-]
-
-BU_DESTINO = "Miscelaneus"
+from src.utils.config_loader import get_config
 
 
 # ════════════════════════════════════════════════════════════
-# FUNCIONES PRINCIPALES
+# 🔄 COMPATIBILIDAD: cargar_config_miscelaneus()
 # ════════════════════════════════════════════════════════════
-def es_item_miscelaneus(
-    nombre_item: str,
-    palabras_sin_filtro: List[str] = None,
-    palabras_con_filtro_guion: List[str] = None,
-) -> bool:
+def cargar_config_miscelaneus() -> Dict[str, Any]:
     """
-    Determina si un item debe reasignarse a 'Miscelaneus'.
+    🔄 Compatibilidad con procesar_outbound/sea/land legacy.
 
-    Args:
-        nombre_item: Nombre/descripción del item (ej: "BASE PLASTICA")
-        palabras_sin_filtro: Lista de keywords que SIEMPRE reasignan
-        palabras_con_filtro_guion: Keywords que solo reasignan SI NO hay guion
+    Lee la configuración de Miscelaneus desde config.yaml y retorna
+    un dict listo para usar en aplicar_regla_miscelaneus().
 
     Returns:
-        True si debe reasignarse a Miscelaneus, False en caso contrario.
-
-    Ejemplos:
-        >>> es_item_miscelaneus("BASE PLASTICA")
-        True
-        >>> es_item_miscelaneus("0070-1200005")
-        False
-        >>> es_item_miscelaneus("TAPA-1234")
-        False  # tiene guion
-        >>> es_item_miscelaneus("CHAROLA PLASTICA")
-        True
+        dict con:
+        - palabras_sin_filtro:        list[str]
+        - palabras_con_filtro_guion:  list[str]
+        - bu_destino:                 str (default "Miscelaneus")
     """
-    if not isinstance(nombre_item, str) or not nombre_item.strip():
-        return False
+    config = get_config()
 
-    nombre_upper = nombre_item.upper()
-    palabras_sin = palabras_sin_filtro or PALABRAS_SIN_FILTRO
-    palabras_con = palabras_con_filtro_guion or PALABRAS_CON_FILTRO_GUION
-
-    # Caso 1: palabras que SIEMPRE reasignan (PLASTIC, CHAROLA)
-    for palabra in palabras_sin:
-        if palabra.upper() in nombre_upper:
-            return True
-
-    # Caso 2: palabras que reasignan SOLO si no hay guion (TAPA, BASE, CAJA)
-    tiene_guion = "-" in nombre_upper
-    if not tiene_guion:
-        for palabra in palabras_con:
-            if palabra.upper() in nombre_upper:
-                return True
-
-    return False
-
-
-def aplicar_regla_miscelaneus(
-    df: pd.DataFrame,
-    columna_item: str,
-    columna_bu_origen: str = "BU",
-    columna_bu_destino: str = "BU Final",
-    palabras_sin_filtro: List[str] = None,
-    palabras_con_filtro_guion: List[str] = None,
-    bu_miscelaneus: str = BU_DESTINO,
-) -> Tuple[pd.DataFrame, Dict]:
-    """
-    Aplica la regla Miscelaneus a un DataFrame y devuelve:
-      1. El DataFrame con la nueva columna 'BU Final'
-      2. Un reporte de auditoría con los items reasignados
-
-    Args:
-        df: DataFrame con datos
-        columna_item: Nombre de la columna que tiene la descripción del item
-                      (ej: "No. Parte Prov." en Land, "Item" en Outbound,
-                       "Item Code" en Sea)
-        columna_bu_origen: Columna del BU original (default: "BU")
-        columna_bu_destino: Nombre de la columna nueva (default: "BU Final")
-        palabras_sin_filtro: Keywords que siempre reasignan
-        palabras_con_filtro_guion: Keywords que solo reasignan sin guion
-        bu_miscelaneus: BU destino (default: "Miscelaneus")
-
-    Returns:
-        Tupla: (df_modificado, reporte_dict)
-
-        reporte_dict contiene:
-            - 'items_reasignados': int
-            - 'monto_reasignado': float (si existe 'Calc_Exp' o 'Amount')
-            - 'bus_origen_reasignados': List[str]
-            - 'detalle': DataFrame con items reasignados
-    """
-    if df is None or len(df) == 0:
-        return df, {"items_reasignados": 0, "detalle": pd.DataFrame()}
-
-    if columna_item not in df.columns:
-        logger.warning(
-            f"⚠️ Columna '{columna_item}' no existe en el DataFrame. "
-            f"Disponibles: {list(df.columns)}. Se omite regla Miscelaneus."
-        )
-        df[columna_bu_destino] = df.get(columna_bu_origen, "Sin BU")
-        return df, {"items_reasignados": 0, "detalle": pd.DataFrame()}
-
-    df = df.copy()
-
-    # Aplicar la regla item por item (vectorizado con .apply)
-    mascara_miscelaneus = df[columna_item].apply(
-        lambda x: es_item_miscelaneus(x, palabras_sin_filtro, palabras_con_filtro_guion)
-    )
-
-    # Crear columna BU Final = BU Origen, excepto donde aplique la regla
-    df[columna_bu_destino] = df[columna_bu_origen].copy()
-    df.loc[mascara_miscelaneus, columna_bu_destino] = bu_miscelaneus
-
-    # ════════════════════════════════════════════════════════
-    # REPORTE DE AUDITORÍA
-    # ════════════════════════════════════════════════════════
-    items_reasignados = int(mascara_miscelaneus.sum())
-    df_reasignados = df[mascara_miscelaneus].copy()
-
-    # Calcular monto reasignado si existe alguna columna de monto
-    monto_reasignado = 0.0
-    columnas_monto_posibles = ["Calc_Exp", "Amount", "Monto", "Cost"]
-    columna_monto_encontrada = None
-    for col in columnas_monto_posibles:
-        if col in df.columns:
-            columna_monto_encontrada = col
-            monto_reasignado = float(df.loc[mascara_miscelaneus, col].sum())
-            break
-
-    bus_origen = sorted(df_reasignados[columna_bu_origen].dropna().unique().tolist())
-
-    reporte = {
-        "items_reasignados": items_reasignados,
-        "monto_reasignado": round(monto_reasignado, 2),
-        "columna_monto_usada": columna_monto_encontrada,
-        "bus_origen_reasignados": bus_origen,
-        "bu_destino": bu_miscelaneus,
-        "detalle": df_reasignados,
-        "palabras_sin_filtro": palabras_sin_filtro or PALABRAS_SIN_FILTRO,
-        "palabras_con_filtro_guion": palabras_con_filtro_guion or PALABRAS_CON_FILTRO_GUION,
+    return {
+        "palabras_sin_filtro": list(
+            config.get("miscelaneus.palabras_sin_filtro", [])
+        ),
+        "palabras_con_filtro_guion": list(
+            config.get("miscelaneus.palabras_con_filtro_guion", [])
+        ),
+        "bu_destino": config.get("miscelaneus.bu_destino", "Miscelaneus"),
     }
 
-    # ════════════════════════════════════════════════════════
-    # LOGGING
-    # ════════════════════════════════════════════════════════
-    if items_reasignados > 0:
-        logger.info(
-            f"🔄 Regla Miscelaneus aplicada: {items_reasignados} items reasignados "
-            f"desde {bus_origen} → '{bu_miscelaneus}'"
-        )
-        if monto_reasignado > 0:
-            logger.info(f"   💰 Monto reasignado: ${monto_reasignado:,.2f}")
+
+# ════════════════════════════════════════════════════════════
+# FUNCIÓN CORE: ¿es_miscelaneus()?
+# ════════════════════════════════════════════════════════════
+def es_miscelaneus(
+    descripcion,
+    palabras_sin_filtro: Optional[List[str]] = None,
+    palabras_con_filtro_guion: Optional[List[str]] = None,
+) -> Tuple[bool, str]:
+    """
+    Determina si un item debe reclasificarse como Miscelaneus.
+
+    Args:
+        descripcion: Descripción o Item Code a evaluar
+        palabras_sin_filtro: Si None, lee de config
+        palabras_con_filtro_guion: Si None, lee de config
+
+    Returns:
+        (es_misc, razon)
+    """
+    if descripcion is None or pd.isna(descripcion):
+        return False, "Descripción vacía"
+
+    desc = str(descripcion).strip().upper()
+    if not desc:
+        return False, "Descripción vacía"
+
+    # Cargar config si no se pasó como argumento
+    if palabras_sin_filtro is None or palabras_con_filtro_guion is None:
+        cfg = cargar_config_miscelaneus()
+        if palabras_sin_filtro is None:
+            palabras_sin_filtro = cfg["palabras_sin_filtro"]
+        if palabras_con_filtro_guion is None:
+            palabras_con_filtro_guion = cfg["palabras_con_filtro_guion"]
+
+    # ────────────────────────────────────────────────────
+    # NIVEL 1: palabras_sin_filtro (siempre match)
+    # Ej: "BASE PLASTICA", "CAJAS PLASTICAS", "CHAROLA"
+    # ────────────────────────────────────────────────────
+    for palabra in palabras_sin_filtro:
+        palabra_upper = str(palabra).strip().upper()
+        if palabra_upper and palabra_upper in desc:
+            return True, f"Match SIN_FILTRO: '{palabra_upper}'"
+
+    # ────────────────────────────────────────────────────
+    # NIVEL 2: palabras_con_filtro_guion
+    # Solo match si NO está precedida por guion
+    # Ej: "BASE PLASTICA" → Miscelaneus ✅
+    #     "0070-PLASTIC-001" → NO (es parte del SKU)
+    # ────────────────────────────────────────────────────
+    for palabra in palabras_con_filtro_guion:
+        palabra_upper = str(palabra).strip().upper()
+        if not palabra_upper:
+            continue
+        # \b = límite de palabra | (?<!-) = NO precedida por guion
+        patron = r"(?<!-)\b" + re.escape(palabra_upper) + r"\b"
+        if re.search(patron, desc):
+            return True, f"Match CON_FILTRO (sin guion): '{palabra_upper}'"
+
+    return False, "No coincide con ninguna palabra clave"
+
+
+# ════════════════════════════════════════════════════════════
+# 🔄 FUNCIÓN PRINCIPAL: aplicar_regla_miscelaneus()
+# ════════════════════════════════════════════════════════════
+def aplicar_regla_miscelaneus(
+    df: pd.DataFrame,
+    columna_item: str = "Item",
+    columna_descripcion: str = "Description",
+    columna_bu_origen: str = "BU",
+    columna_bu_destino: str = "BU Final",
+    palabras_sin_filtro: Optional[List[str]] = None,
+    palabras_con_filtro_guion: Optional[List[str]] = None,
+    bu_miscelaneus: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    🔄 Aplica la regla Miscelaneus a un DataFrame.
+
+    Crea/actualiza la columna `columna_bu_destino` con:
+      - "Miscelaneus" si el item coincide con palabras clave
+      - El valor de `columna_bu_origen` en caso contrario
+
+    Args:
+        df: DataFrame a procesar
+        columna_item: nombre de la columna Item Code (fallback)
+        columna_descripcion: nombre de la columna de descripción
+        columna_bu_origen: columna con el BU original (ej. "BU")
+        columna_bu_destino: columna donde escribir el resultado (ej. "BU Final")
+        palabras_sin_filtro: si None, lee de config.yaml
+        palabras_con_filtro_guion: si None, lee de config.yaml
+        bu_miscelaneus: nombre del BU destino (default "Miscelaneus")
+
+    Returns:
+        (df_modificado, reporte_dict)
+
+        reporte_dict contiene:
+        - items_reasignados:     int
+        - monto_reasignado:      float (si hay columna 'Calc_Exp' o 'Amount')
+        - bus_origen_reasignados: list[str] (BUs de origen únicos reasignados)
+        - bu_destino:            str
+        - detalle:               DataFrame con los items reasignados
+    """
+    # Cargar config si faltan parámetros
+    if (
+        palabras_sin_filtro is None
+        or palabras_con_filtro_guion is None
+        or bu_miscelaneus is None
+    ):
+        cfg = cargar_config_miscelaneus()
+        if palabras_sin_filtro is None:
+            palabras_sin_filtro = cfg["palabras_sin_filtro"]
+        if palabras_con_filtro_guion is None:
+            palabras_con_filtro_guion = cfg["palabras_con_filtro_guion"]
+        if bu_miscelaneus is None:
+            bu_miscelaneus = cfg["bu_destino"]
+
+    df_resultado = df.copy()
+
+    # ────────────────────────────────────────────────────
+    # 1. Inicializar BU Destino con BU Origen
+    # ────────────────────────────────────────────────────
+    if columna_bu_origen in df_resultado.columns:
+        df_resultado[columna_bu_destino] = df_resultado[columna_bu_origen]
     else:
-        logger.info("✓ Regla Miscelaneus aplicada: 0 items afectados")
+        df_resultado[columna_bu_destino] = "Sin Asignar"
 
-    return df, reporte
+    # ────────────────────────────────────────────────────
+    # 2. Evaluar fila por fila si es Miscelaneus
+    # ────────────────────────────────────────────────────
+    indices_reasignados = []
+    razones = []
 
+    for idx in df_resultado.index:
+        # Buscar valor a evaluar: primero Description, luego Item
+        valor_a_evaluar = None
 
-def cargar_config_miscelaneus() -> Dict:
-    """
-    Carga la configuración de Miscelaneus desde config.yaml si existe.
-    Si no, usa los defaults definidos arriba.
-    """
-    try:
-        from src.utils.config_loader import get_config
-        config = get_config()
+        if columna_descripcion in df_resultado.columns:
+            val_desc = df_resultado.at[idx, columna_descripcion]
+            if val_desc is not None and not pd.isna(val_desc):
+                valor_a_evaluar = val_desc
 
-        palabras_sin = config.get("miscelaneus.palabras_sin_filtro", PALABRAS_SIN_FILTRO)
-        palabras_con = config.get("miscelaneus.palabras_con_filtro_guion", PALABRAS_CON_FILTRO_GUION)
-        bu_destino = config.get("miscelaneus.bu_destino", BU_DESTINO)
+        if valor_a_evaluar is None and columna_item in df_resultado.columns:
+            val_item = df_resultado.at[idx, columna_item]
+            if val_item is not None and not pd.isna(val_item):
+                valor_a_evaluar = val_item
 
-        return {
-            "palabras_sin_filtro": palabras_sin,
-            "palabras_con_filtro_guion": palabras_con,
-            "bu_destino": bu_destino,
-        }
-    except Exception as e:
-        logger.warning(f"No se pudo cargar config de Miscelaneus, usando defaults: {e}")
-        return {
-            "palabras_sin_filtro": PALABRAS_SIN_FILTRO,
-            "palabras_con_filtro_guion": PALABRAS_CON_FILTRO_GUION,
-            "bu_destino": BU_DESTINO,
-        }
+        if valor_a_evaluar is None:
+            continue
+
+        es_misc, razon = es_miscelaneus(
+            valor_a_evaluar,
+            palabras_sin_filtro=palabras_sin_filtro,
+            palabras_con_filtro_guion=palabras_con_filtro_guion,
+        )
+
+        if es_misc:
+            df_resultado.at[idx, columna_bu_destino] = bu_miscelaneus
+            indices_reasignados.append(idx)
+            razones.append(razon)
+
+    # ────────────────────────────────────────────────────
+    # 3. Construir reporte
+    # ────────────────────────────────────────────────────
+    n_reasignados = len(indices_reasignados)
+
+    # BUs origen únicos reasignados
+    bus_origen_reasignados = []
+    if n_reasignados > 0 and columna_bu_origen in df_resultado.columns:
+        bus_origen_reasignados = sorted(
+            df_resultado.loc[indices_reasignados, columna_bu_origen]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+    # Monto reasignado (si hay columna de monto)
+    monto_reasignado = 0.0
+    columna_monto = None
+    for col_candidata in ("Calc_Exp", "Amount", "Monto", "Total"):
+        if col_candidata in df_resultado.columns:
+            columna_monto = col_candidata
+            break
+
+    if columna_monto and n_reasignados > 0:
+        monto_reasignado = float(
+            pd.to_numeric(
+                df_resultado.loc[indices_reasignados, columna_monto],
+                errors="coerce",
+            ).fillna(0).sum()
+        )
+
+    # Detalle de items reasignados
+    detalle = (
+        df_resultado.loc[indices_reasignados].copy()
+        if n_reasignados > 0
+        else pd.DataFrame()
+    )
+
+    reporte = {
+        "items_reasignados":      n_reasignados,
+        "monto_reasignado":       round(monto_reasignado, 2),
+        "bus_origen_reasignados": bus_origen_reasignados,
+        "bu_destino":             bu_miscelaneus,
+        "detalle":                detalle,
+        "razones":                razones,
+    }
+
+    return df_resultado, reporte

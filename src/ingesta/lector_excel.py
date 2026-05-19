@@ -36,6 +36,110 @@ logger = configurar_logger("ingesta")
 
 
 # ============================================================
+# 🔧 COALESCE DE COLUMNAS DE PESO (FIX BLOQUES DUPLICADOS)
+# ============================================================
+def _coalesce_peso(
+    df: pd.DataFrame,
+    columna_destino: str = "Peso Bruto",
+) -> pd.DataFrame:
+    """
+    Fusiona múltiples columnas de peso (Gross Weight, Gross Weight.1, .2, .3)
+    en una sola columna canónica.
+
+    🎯 PROBLEMA: Los archivos ERP (SAP, Oracle, JDA) reportan pesos en
+    múltiples bloques de columnas (Principal / Cartons / Covers / Pallets).
+    Pandas genera nombres con sufijos .1, .2, .3 al detectar duplicados.
+    El mapeador eligió la primera columna pero algunas filas tienen el
+    peso REAL en bloques posteriores.
+
+    🔧 FIX: Para cada fila donde el peso destino es NaN o 0, buscar
+    secuencialmente en columnas alternativas y tomar el primer valor > 0.
+
+    Prioridad (de mayor a menor):
+        1. columna_destino actual (si ya tiene valor > 0)
+        2. Gross Weight (Kgs)
+        3. Gross Weight (Kgs).1   (Cartons)
+        4. Gross Weight (Kgs).2   (Covers)     ← 🎯 las 12 filas perdidas
+        5. Gross Weight (Kgs).3   (Pallets adicionales)
+        6. Cualquier otra columna que empiece con prefijos conocidos
+
+    Args:
+        df: DataFrame con columna `Peso Bruto` (puede tener NaN/0)
+        columna_destino: nombre de la columna destino canónica
+
+    Returns:
+        DataFrame con columna `columna_destino` completada
+    """
+    if columna_destino not in df.columns:
+        logger.warning(f"   ⚠️ '{columna_destino}' no existe — skip coalesce")
+        return df
+
+    # Prefijos de columnas que pueden contener peso bruto
+    prefijos_peso = (
+        "Gross Weight",
+        "Peso Bruto",
+        "Total Gross Weight",
+        "Carton Gross Weight",
+    )
+
+    # Listar TODAS las columnas alternativas (excepto la destino)
+    columnas_alt = [
+        c for c in df.columns
+        if c != columna_destino
+        and any(c.lower().startswith(p.lower()) for p in prefijos_peso)
+    ]
+
+    if not columnas_alt:
+        logger.info(f"   ℹ️ Sin columnas alternativas de peso para coalescer")
+        return df
+
+    logger.info(
+        f"   🔧 Coalesce '{columna_destino}': "
+        f"{len(columnas_alt)} columnas alternativas → {columnas_alt}"
+    )
+
+    # Convertir destino a numérico
+    df[columna_destino] = pd.to_numeric(df[columna_destino], errors="coerce")
+
+    # Máscara de filas sin peso válido
+    mask_sin_peso = df[columna_destino].isna() | (df[columna_destino] == 0)
+    n_inicial = int(mask_sin_peso.sum())
+
+    if n_inicial == 0:
+        logger.info(f"   ✅ Todas las filas tienen peso válido — skip")
+        return df
+
+    logger.info(f"   🔍 Filas sin peso al inicio: {n_inicial}")
+
+    # Recorrer alternativas en orden y rellenar
+    for col_alt in columnas_alt:
+        if not mask_sin_peso.any():
+            break  # ya están todas resueltas
+
+        peso_alt = pd.to_numeric(df[col_alt], errors="coerce")
+        mask_recuperable = mask_sin_peso & peso_alt.notna() & (peso_alt > 0)
+        n_recuperadas = int(mask_recuperable.sum())
+
+        if n_recuperadas > 0:
+            df.loc[mask_recuperable, columna_destino] = peso_alt[mask_recuperable]
+            logger.info(
+                f"   ✅ Rescatadas {n_recuperadas} filas desde '{col_alt}'"
+            )
+            # Actualizar máscara
+            mask_sin_peso = df[columna_destino].isna() | (df[columna_destino] == 0)
+
+    n_final = int(mask_sin_peso.sum())
+    n_rescatadas = n_inicial - n_final
+
+    logger.info(
+        f"   📊 Resultado: rescatadas {n_rescatadas}/{n_inicial} filas "
+        f"(quedaron {n_final} sin peso)"
+    )
+
+    return df
+
+
+# ============================================================
 # FUNCIÓN AUXILIAR DE LECTURA TOLERANTE
 # ============================================================
 def _leer_hoja_tolerante(
@@ -137,11 +241,42 @@ def cargar_land(archivo, hoja_forzada: Optional[str] = None) -> pd.DataFrame:
     
     df, info = _leer_hoja_tolerante(archivo, "land", hoja_forzada)
     
-    # Normalización de columnas LÓGICAS
+    # ─────────────────────────────────────────────────────────
+    # 🔧 FIX MERGED CELLS: Forward-fill ANTES de normalizar
+    #    Excel "ve" las celdas merged como repetidas. Pandas las lee
+    # como NaN para las filas inferiores. Aquí replicamos Excel.
+    # ─────────────────────────────────────────────────────────
+    columnas_a_rellenar_ffill = [
+        "Reference",
+        "Waybill Number",
+        "Container",
+        "Customer",
+        "Transporte",
+        "Fecha Embarque",
+        "Address",
+        "Company",
+    ]
+    for col in columnas_a_rellenar_ffill:
+        if col in df.columns:
+            # Solo rellenar si hay NaN intercalados (no si la columna está toda vacía)
+            if df[col].notna().any():
+                n_nan_antes = df[col].isna().sum()
+                df[col] = df[col].ffill()
+                n_nan_despues = df[col].isna().sum()
+                if n_nan_antes > n_nan_despues:
+                    logger.info(
+                        f"   🔄 Forward-fill aplicado a '{col}': "
+                        f"{n_nan_antes - n_nan_despues} celdas rellenadas (merged cells)"
+                    )
+
+    # ─────────────────────────────────────────────────────────
+    # NORMALIZACIÓN DE COLUMNAS CRÍTICAS
+    # ─────────────────────────────────────────────────────────
     df["Reference"] = normalizar_texto(df["Reference"])
+    df = _coalesce_peso(df, columna_destino="Peso Bruto")   # 🔧 FIX bloques duplicados
     df["Peso Bruto"] = normalizar_numerico(df["Peso Bruto"])
     df["Item"] = normalizar_texto(df["Item"])
-    
+
     # BU es opcional (puede no existir)
     if "BU" in df.columns:
         df["BU"] = normalizar_texto(df["BU"])
@@ -212,6 +347,7 @@ def cargar_outbound(
     # NORMALIZACIÓN DE COLUMNAS CRÍTICAS
     # ─────────────────────────────────────────────────────────
     df["Reference"] = normalizar_texto(df["Reference"])
+    df = _coalesce_peso(df, columna_destino="Peso Bruto")   # 🔧 FIX bloques duplicados
     df["Peso Bruto"] = normalizar_numerico(df["Peso Bruto"])
     df["Item"] = normalizar_texto(df["Item"])
     
@@ -484,6 +620,7 @@ def cargar_sea(archivo, hoja_forzada: Optional[str] = None) -> pd.DataFrame:
     df, info = _leer_hoja_tolerante(archivo, "sea", hoja_forzada)
     
     df["Container"] = normalizar_texto(df["Container"])
+    df = _coalesce_peso(df, columna_destino="Peso Bruto")   # 🔧 FIX bloques duplicados
     df["Peso Bruto"] = normalizar_numerico(df["Peso Bruto"])
     df["Item"] = normalizar_texto(df["Item"])
     

@@ -1,171 +1,121 @@
-# ============================================================
-# CONFIGURACIÓN DEL SISTEMA DE CONSOLIDACIÓN LOGÍSTICA
-# ============================================================
-# Este archivo permite modificar parámetros SIN tocar código
-# ============================================================
-
+# ═══════════════════════════════════════════════════════════════
+# CONFIG.YAML — Fuente única de verdad del sistema
+# ═══════════════════════════════════════════════════════════════
 aplicacion:
   nombre: "Consolidación Logística"
-  version: "1.0.0"
+  version: "2.0.0"
   idioma: "es-MX"
 
-# ============================================================
-# COSTOS FIJOS POR TIPO DE OPERACIÓN
-# ============================================================
+# ────────────────────────────────────────────────────────────
+# COSTOS FIJOS POR OPERACIÓN (USD)
+# ────────────────────────────────────────────────────────────
 costos:
-  outbound:
-    valor: 1500
-    moneda: "USD"
-    unidad: "por Reference"
-    descripcion: "Costo fijo por cada Waybill/Reference de exportación"
-  
   sea:
     valor: 2500
+    unidad: "Container"
     moneda: "USD"
-    unidad: "por Contenedor"
-    descripcion: "Costo fijo por cada Container Number"
-  
   land:
     valor: 1200
+    unidad: "Reference"
     moneda: "USD"
-    unidad: "por Reference"
-    descripcion: "Costo fijo por cada Reference terrestre"
-
-# ============================================================
-# REGLAS DE EXCLUSIÓN
-# ============================================================
-exclusiones:
-  summary_pct_sea:
-    bu_excluidos: ["Capex", "MCS"]
-    descripcion: "Estos BU se excluyen del cálculo de %PCT en Summary (Sea)"
-
-# ============================================================
-# REGLAS ESPECIALES - CAPEX
-# ============================================================
-capex:
-  patron_item_code: "CAPEX"  # Si Item Code contiene esta palabra
-  bu_asignado: "Capex"
-  peso: 0
-  pct_pond: 1.0  # 100%
-  origen: "manual"  # Se ingresa manualmente, no viene del reporte
-
-# ============================================================
-# MAPEO DE COLUMNAS POR HOJA
-# ============================================================
-columnas:
   outbound:
-    fila_encabezado: 8
-    mapeo:
-      inbound_outbound: "B"
-      method: "C"
-      reference: "D"
-      bu: "E"
-      gross_weight: "F"
-      waybill_number: "G"
-      customer: "N"
-      address: "O"
-      item: "AR"
-      qty_pzas: "AS"
-  
+    valor: 1500
+    unidad: "Waybill"
+    moneda: "USD"
+
+# ────────────────────────────────────────────────────────────
+# TOLERANCIAS DE VALIDACIÓN (críticas)
+# ────────────────────────────────────────────────────────────
+validaciones:
+  tolerancia_costo: 0.01      # USD - diferencia máxima por grupo
+  tolerancia_pct: 0.0001      # 0.01% - suma de porcentajes
+  decimales_monto: 2
+  decimales_pct: 4
+  bloquear_export_si_error: true   # 🔴 si hay ERROR, NO permite descargar
+
+# ────────────────────────────────────────────────────────────
+# DETECCIÓN AUTOMÁTICA DE TIPO DE ARCHIVO
+# ────────────────────────────────────────────────────────────
+deteccion:
+  outbound:
+    keywords_obligatorias: ["Waybill", "Pallets", "Cartons"]
+    keywords_opcionales: ["Invoice", "SAT", "Customer"]
+    score_minimo: 15
   sea:
-    fila_encabezado: 5
-    mapeo:
-      bu: "B"
-      item_code: "P"
-      container_number: "AZ"
-      total_gross_weight: "BO"
-  
+    keywords_obligatorias: ["Container", "Subinventory", "Item Code"]
+    keywords_opcionales: ["Total Gross Weight"]
+    score_minimo: 12
   land:
-    fila_encabezado: 5
-    mapeo:
-      inbound_outbound: "B"
-      method: "C"
-      reference: "D"
-      bu: "E"
-      peso_bruto: "AZ"
-      no_parte_prov: "BC"
+    keywords_obligatorias: ["Referencia", "Caja", "No. Parte"]
+    keywords_opcionales: ["Bultos", "Aduana", "Pedimento"]
+    score_minimo: 10
 
-# ============================================================
-# RUTAS
-# ============================================================
+# ────────────────────────────────────────────────────────────
+# HOJAS A IGNORAR (en cualquier archivo)
+# ────────────────────────────────────────────────────────────
+hojas_ignoradas:
+  - "Sheet2"
+  - "Sheet3"
+  - "XDO_METADATA"
+  - "Hoja2"
+  - "Hoja3"
+  - "Instructivo"
+  - "Notas"
+
+# ────────────────────────────────────────────────────────────
+# REGLA MISCELANEUS (palabras clave para reasignación)
+# ────────────────────────────────────────────────────────────
+miscelaneus:
+  bu_destino: "Miscelaneus"
+  # Palabras que SIEMPRE reasignan (sin importar guion)
+  palabras_sin_filtro:
+    - "PLASTIC"
+    - "PLASTICA"
+    - "PLASTICAS"
+    - "CHAROLA"
+    - "CHAROLAS"
+  # Palabras que SOLO reasignan si NO tienen guion antes (parte de SKU)
+  palabras_con_filtro_guion:
+    - "TAPA"
+    - "BASE"
+    - "CAJA"
+    - "CAJAS"
+
+# ────────────────────────────────────────────────────────────
+# BUS ESPECIALES (no participan en %PCT de Sea)
+# ────────────────────────────────────────────────────────────
+bus_especiales:
+  excluidos_pct_sea:
+    - "Capex"
+    - "MCS"
+  marcadores_problema:
+    - "SIN_BU"
+    - "AMBIGUO"
+
+# ────────────────────────────────────────────────────────────
+# DETECCIÓN DE BU EN OUTBOUND (extracción del Reference)
+# ────────────────────────────────────────────────────────────
+outbound_bu:
+  # Patrón regex para extraer BU del Reference
+  # Ej: FG-R-2209LE26.M46/M45 → captura M46 y M45
+  patron_regex: "M\\d{2}"
+  # Si hay múltiples BUs separados por /, usar EL ÚLTIMO
+  usar_ultimo_si_multiple: true
+
+# ────────────────────────────────────────────────────────────
+# RUTAS DE ARCHIVOS DE DATOS
+# ────────────────────────────────────────────────────────────
 rutas:
-  input: "./data/input"
-  output: "./data/output"
-  logs: "./logs"
-  bu_catalog: "./src/reglas/bu_catalog.json"
+  maestro_bu_sea: "src/config/maestro_bu_sea.json"
+  catalogo_bu: "src/config/bu_catalog.json"
+  logs: "logs/app.log"
 
-# ============================================================
+# ────────────────────────────────────────────────────────────
 # LOGGING
-# ============================================================
+# ────────────────────────────────────────────────────────────
 logging:
-  nivel: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  nivel: "INFO"
   archivo: "./logs/app.log"
-  formato: "%(asctime)s | %(levelname)s | %(module)s | %(message)s"
+  formato: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   rotacion_mb: 10
   backup_count: 5
-
-# ============================================================
-# VALIDACIONES
-# ============================================================
-validaciones:
-  tolerancia_costo: 0.01  # USD - diferencia aceptable en validación de suma
-  alertar_bu_desconocido: true
-  bloquear_si_error_critico: true
-
-  # ═══════════════════════════════════════════════════════════
-# REGLA MISCELANEUS
-# Reasigna items con palabras clave (plásticos, charolas, etc.)
-# al BU "Miscelaneus" sin importar su BU original detectado.
-# ═══════════════════════════════════════════════════════════
-miscelaneus:
-  # BU destino para los items reasignados
-  bu_destino: "Miscelaneus"
-
-  # Keywords que SIEMPRE reasignan (sin importar si hay guion)
-  palabras_sin_filtro:
-    - "PLASTIC"   # PLASTICA, PLASTICO, PLASTICS
-    - "CHAROLA"   # CHAROLA, CHAROLAS
-
-  # Keywords que reasignan SOLO si el nombre NO contiene guion '-'
-  # (evita falsos positivos con códigos de parte como "BASE-1234")
-  palabras_con_filtro_guion:
-    - "TAPA"      # TAPA PLASTICA → SÍ ; TAPA-1234 → NO
-    - "BASE"      # BASE PLASTICA → SÍ ; BASE-5678 → NO
-    - "CAJA"      # CAJAS PLASTICAS → SÍ ; CAJA-XYZ → NO
-
-# Los alias por defecto están definidos en src/ingesta/mapeo_columnas.py
-# Si necesitas agregar aliases personalizados para tu organización,
-# descomenta y agrega aquí:
-#
-# alias_columnas:
-#   Reference:
-#     - "Nro Pedido"
-#     - "Order ID"
-#   BU:
-#     - "Division"
-#
-# Estos se SUMARÁN a los alias del default.
-
-# ═══════════════════════════════════════════════════════════
-# DETECCIÓN DE HOJAS
-# ═══════════════════════════════════════════════════════════
-deteccion_hojas:
-  # Score mínimo para auto-detectar una hoja como válida
-  score_minimo: 25
-  
-  # Máximo de filas a escanear para detectar encabezado
-  max_filas_escanear: 15
-  
-  # Mínimo de columnas reconocibles para considerar una fila como header
-  min_columnas_header: 3
-  
-  # Hojas a ignorar SIEMPRE (case-insensitive, búsqueda parcial)
-  hojas_ignoradas:
-    - "xdo_metadata"
-    - "metadata"
-    - "config"
-    - "instructions"
-    - "readme"
-    - "summary"
-    - "consolidado"
-

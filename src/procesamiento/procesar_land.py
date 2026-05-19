@@ -63,6 +63,9 @@ def _inferir_bu_desde_referencia(referencia: str) -> str:
         return match.group(0)
     return "SIN_BU"
 
+
+
+
 def procesar_land(
     df_land: pd.DataFrame,
     costo_fijo: float = 1200.0,
@@ -127,6 +130,9 @@ def procesar_land(
     
     logger.info(f"📊 Registros recibidos: {len(df)}")
     logger.info(f"   Columnas disponibles: {list(df.columns)[:15]}...")
+
+
+    
     
     # ─────────────────────────────────────────────────────────
     # PASO 1: LIMPIEZA
