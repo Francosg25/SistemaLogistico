@@ -21,6 +21,10 @@ def normalizar_numerico(serie: pd.Series) -> pd.Series:
     Convierte a numérico, manejando formatos con comas y espacios.
     Ejemplo: '1,500.00' → 1500.00
     """
+
+    if isinstance(serie, pd.DataFrame):
+        serie = serie.iloc[:, 0]
+
     if serie.dtype in ["int64", "float64"]:
         return serie
     

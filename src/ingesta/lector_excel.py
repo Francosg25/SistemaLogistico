@@ -283,6 +283,8 @@ def cargar_outbound(
     logger.info(f"✅ OUTBOUND cargado: {len(df)} registros válidos")
     
     df.attrs["info_lectura"] = info
+
+    df = df.loc[:, ~df.columns.duplicated(keep='first')]
     
     # ─────────────────────────────────────────────────────────
     # 🆕 CAPA 3: VALIDACIÓN DE INTEGRIDAD (DENTRO de la función)

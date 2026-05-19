@@ -127,6 +127,8 @@ def procesar_land(
     
     logger.info(f"📊 Registros recibidos: {len(df)}")
     logger.info(f"   Columnas disponibles: {list(df.columns)[:15]}...")
+
+    df[columna_reference] = df[columna_reference].astype(str).str.replace(r'\s+', '', regex=True)
     
     # ─────────────────────────────────────────────────────────
     # PASO 1: LIMPIEZA
