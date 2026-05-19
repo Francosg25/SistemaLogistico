@@ -1,482 +1,388 @@
 """
 ═══════════════════════════════════════════════════════════════
-PROCESADOR OUTBOUND v5 — Integrado con motor nuevo
+PROCESADOR OUTBOUND v6.3 — Detección robusta de BU + Waybill
 ═══════════════════════════════════════════════════════════════
-✅ MANTIENE 100% compatibilidad con pestania_outbound.py
-✅ USA mapeo_columnas canónico (no hardcode de alias)
-✅ USA cascada de BU de 4 niveles (Item → Subinv → Regex → Misc)
-✅ LEE configuración de config.yaml (costos, tolerancias, palabras)
-✅ Fix bug $0.00 (columna __costo_aplicado__)
-✅ Fix bug $500 (sin hardcodes en resumen)
+🎯 Fórmula Excel BP9: =BO9/SUMIFS($BO:$BO,$BI:$BI,BI9)
+🎯 Fórmula Excel BQ9: =XLOOKUP(BI9,$BC:$BC,$BE:$BE)*BP9
+
+Cambios v6.3:
+  • Detección de BU usa Waybill Number (col G) si existe, NO Reference (col D)
+  • Si el Excel YA tiene la columna BU llena → respetarla (no sobreescribir)
+  • Logger más verboso para debugging
 ═══════════════════════════════════════════════════════════════
 """
-import pandas as pd
-import re
-from typing import Dict, Optional
 from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
+import re
+import pandas as pd
+import numpy as np
 
-from src.reglas.regla_miscelaneus import (
-    aplicar_regla_miscelaneus,
-    cargar_config_miscelaneus,
-)
-from src.utils.logger import configurar_logger
-from src.utils.config_loader import get_config
-from src.ingesta.mapeo_columnas import obtener_columnas_canonicas
+# 🔧 Imports tolerantes
+try:
+    from src.reglas.regla_miscelaneus import aplicar_regla_miscelaneus
+except ImportError:
+    def aplicar_regla_miscelaneus(df, columna_item="Item", **kwargs):
+        return df, 0
 
-logger = configurar_logger("procesar_outbound")
+try:
+    from src.utils.logger import configurar_logger
+    logger = configurar_logger("procesar_outbound")
+except ImportError:
+    import logging
+    logger = logging.getLogger("procesar_outbound")
+    logger.setLevel(logging.INFO)
 
 
+# ════════════════════════════════════════════════════════════
+# DETECTOR DE BU EMBEBIDO
+# ════════════════════════════════════════════════════════════
+PATRONES_BU_VALIDOS = ["M01", "M19", "M23", "M45", "M46", "M00"]
+
+
+def _detectar_bu_de_waybill(waybill: str) -> Optional[str]:
+    """
+    Detecta el BU desde el patrón del Waybill.
+    Si hay 2 BUs (ej. M01/M45 o M46-M45), toma el SEGUNDO.
+    
+    Soporta separadores: . / - _ y combinaciones.
+    """
+    if not waybill or pd.isna(waybill):
+        return None
+
+    txt = str(waybill).upper()
+    # Buscar M## como patrón delimitado (acepta . / - _ como separadores)
+    matches = re.findall(r"M\d{2}", txt)
+
+    if not matches:
+        return None
+
+    matches_validos = [m for m in matches if m in PATRONES_BU_VALIDOS]
+
+    if not matches_validos:
+        return None
+
+    if len(matches_validos) >= 2:
+        return matches_validos[1]  # segundo BU si hay 2
+
+    return matches_validos[0]
+
+
+def _detectar_bu_de_item(item: str) -> Optional[str]:
+    """Detecta BU desde el prefijo del Item Code."""
+    if not item or pd.isna(item):
+        return None
+
+    txt = str(item).strip()
+
+    if txt.startswith("1651-"):
+        return "M46"
+    if txt.startswith("1908-"):
+        return "M23"
+
+    return None
+
+
+def detectar_bu_outbound(waybill: str, item: str = "") -> Optional[str]:
+    """Cascada de detección: Waybill → Item Code → None."""
+    bu = _detectar_bu_de_waybill(waybill)
+    if bu:
+        return bu
+
+    bu = _detectar_bu_de_item(item)
+    if bu:
+        return bu
+
+    return None
+
+
+# ════════════════════════════════════════════════════════════
+# 🛡️ NORMALIZADOR DEL RESULTADO DE aplicar_regla_miscelaneus
+# ════════════════════════════════════════════════════════════
+def _normalizar_resultado_misc(resultado: Any, df_original: pd.DataFrame) -> tuple:
+    """Acepta cualquier formato y devuelve (df, n_misc:int)."""
+    if isinstance(resultado, tuple) and len(resultado) == 2:
+        df_res, info = resultado
+
+        if not isinstance(df_res, pd.DataFrame):
+            logger.warning(f"   ⚠️ Primer elemento no es DataFrame: {type(df_res)}")
+            df_res = df_original
+
+        if isinstance(info, dict):
+            n = (
+                info.get("reasignados")
+                or info.get("n_reasignados")
+                or info.get("items_reasignados")
+                or info.get("count")
+                or info.get("total")
+                or info.get("n")
+                or 0
+            )
+            if not n:
+                for v in info.values():
+                    if isinstance(v, (list, tuple, set)):
+                        n = len(v)
+                        break
+            return df_res, int(n) if n else 0
+
+        if isinstance(info, (list, tuple, set)):
+            return df_res, len(info)
+
+        if isinstance(info, (int, float)):
+            return df_res, int(info)
+
+        if info is None:
+            return df_res, 0
+
+        logger.warning(f"   ⚠️ Tipo inesperado: {type(info)}")
+        return df_res, 0
+
+    if isinstance(resultado, pd.DataFrame):
+        return resultado, 0
+
+    logger.warning(f"   ⚠️ Formato inesperado: {type(resultado)}")
+    return df_original, 0
+
+
+# ════════════════════════════════════════════════════════════
+# RESULTADO
+# ════════════════════════════════════════════════════════════
 @dataclass
 class ResultadoOutbound:
-    """Contrato compatible con pestania_outbound.py (NO cambiar campos)."""
-    detalle: pd.DataFrame
+    df_detalle: pd.DataFrame
     resumen_bu: pd.DataFrame
     resumen_waybills: pd.DataFrame
-    metricas: Dict = field(default_factory=dict)
-    advertencias: list = field(default_factory=list)
-    reporte_miscelaneus: Dict = field(default_factory=dict)
+    metricas: Dict[str, Any] = field(default_factory=dict)
 
 
 # ════════════════════════════════════════════════════════════
-# FUNCIONES AUXILIARES
-# ════════════════════════════════════════════════════════════
-def _inferir_bu_desde_waybill(waybill: str, usar_ultimo: bool = True) -> str:
-    """
-    Extrae el BU del Waybill Number.
-    
-    Args:
-        waybill: el string del Waybill (ej. 'FG-R-2209LE26.M46/M45')
-        usar_ultimo: si True, devuelve el ÚLTIMO BU (regla OUTBOUND)
-                     si False, devuelve el PRIMERO (regla SEA/LAND)
-    """
-    if not isinstance(waybill, str):
-        return "SIN_BU"
-
-    bus = re.findall(r"M\d{2}", waybill.upper())
-    if len(bus) == 0:
-        return "SIN_BU"
-    return bus[-1] if usar_ultimo else bus[0]
-
-
-def _extraer_reference_base(ref) -> str:
-    """Quita sufijos: 'FG-R-2209LE26.M46/M45' → 'FG-R-2209LE26'."""
-    if not isinstance(ref, str):
-        ref = str(ref) if ref is not None else ""
-    return ref.split(".")[0].split("-M")[0].strip() if ref else ""
-
-
-def _normalizar_alias_columnas(
-    df: pd.DataFrame,
-    columna_waybill: str,
-    columna_peso: str,
-    columna_item: str,
-) -> pd.DataFrame:
-    df = df.copy()
-    canonicas = obtener_columnas_canonicas(df)
-
-    # 🔧 NUEVO: Si pidieron 'Waybill Number' pero no existe, buscar 'Waybill' canónica
-    if columna_waybill not in df.columns:
-        if "Waybill" in canonicas:
-            df[columna_waybill] = df[canonicas["Waybill"]]
-            logger.info(f"   🔄 '{canonicas['Waybill']}' promovido a '{columna_waybill}'")
-        elif "Reference" in canonicas:
-            # Fallback: usar Reference (caso archivos sin Waybill Number)
-            df[columna_waybill] = df[canonicas["Reference"]]
-            logger.info(f"   🔄 Fallback: '{canonicas['Reference']}' → '{columna_waybill}'")
-
-    # ... resto igual
-    requeridos = {
-        "Gross_Weight": columna_peso,
-        "Item":         columna_item,
-    }
-
-    for canonica, nombre_interno in requeridos.items():
-        if nombre_interno in df.columns:
-            continue
-        if canonica in canonicas:
-            col_real = canonicas[canonica]
-            df[nombre_interno] = df[col_real]
-            logger.info(f"   🔄 '{col_real}' promovido a '{nombre_interno}'")
-
-    return df
-
-
-# ════════════════════════════════════════════════════════════
-# FUNCIÓN PRINCIPAL
+# 🎯 FUNCIÓN PRINCIPAL
 # ════════════════════════════════════════════════════════════
 def procesar_outbound(
     df_outbound: pd.DataFrame,
-    costo_fijo: Optional[float] = None,
+    costo_fijo: float = 1500.0,
     df_costos: Optional[pd.DataFrame] = None,
-    columna_waybill: str = "Waybill Number",
+    columna_waybill: str = "Waybill Number",  # 🆕 v6.3: default cambiado a Waybill Number
     columna_peso: str = "Peso Bruto",
     columna_item: str = "Item",
-    columna_bu: str = "BU",
+    tolerancia: float = 0.01,
 ) -> ResultadoOutbound:
     """
-    Procesa OUTBOUND con prorrateo + regla Miscelaneus.
-
-    Args:
-        df_outbound: DataFrame crudo del Outbound
-        costo_fijo: si None, lee de config.yaml ('costos.outbound.valor')
-        df_costos: tabla opcional con [Reference, Fix Cost] para overrides
-        columna_waybill: nombre de la columna de Waybill (default 'Reference')
-        columna_peso: nombre de columna de peso (default 'Peso Bruto')
-        columna_item: nombre de columna de Item
-        columna_bu: nombre de columna de BU (default 'BU')
-
-    Returns:
-        ResultadoOutbound (compatible con pestania_outbound.py)
+    Procesa OUTBOUND aplicando fórmulas idénticas al Excel original.
+    
+    🆕 v6.3: 
+      • Por DEFAULT agrupa por 'Waybill Number' (no por 'Reference')
+      • Si el DataFrame ya tiene columna 'BU' llena, la respeta
+      • Detección de BU desde Waybill ahora soporta . / - _ como separadores
     """
     logger.info("=" * 60)
-    logger.info("🚢 INICIANDO PROCESAMIENTO OUTBOUND (v5)")
+    logger.info("🚢 PROCESANDO OUTBOUND v6.3")
     logger.info("=" * 60)
 
-    # ─────────────────────────────────────────────────────────
-    # CONFIGURACIÓN (lee de config.yaml, sin hardcodes)
-    # ─────────────────────────────────────────────────────────
-    config = get_config()
-
-    if costo_fijo is None:
-        costo_fijo = float(config.get("costos.outbound.valor", 1500))
-        logger.info(f"   💰 Costo fijo desde config.yaml: ${costo_fijo}")
-    else:
-        costo_fijo = float(costo_fijo)
-
-    tolerancia = float(config.get("validaciones.tolerancia_costo", 0.01))
-    decimales = int(config.get("validaciones.decimales_monto", 2))
-    bus_especiales_config = set(
-        config.get("bus_especiales.excluidos_pct_sea", [])
-    ) | {"Miscelaneus", "Machine", "Sin Asignar"}
-
-    # ─────────────────────────────────────────────────────────
-    # VALIDACIÓN INICIAL
-    # ─────────────────────────────────────────────────────────
-    if df_outbound is None or len(df_outbound) == 0:
-        raise ValueError("El DataFrame de Outbound está vacío.")
-
     df = df_outbound.copy()
-    advertencias = []
-
-    # ─────────────────────────────────────────────────────────
-    # PASO 0: NORMALIZACIÓN DE COLUMNAS (sistema canónico)
-    # ─────────────────────────────────────────────────────────
-    df = _normalizar_alias_columnas(df, columna_waybill, columna_peso, columna_item)
-
-    logger.info(f"📊 Registros recibidos: {len(df)}")
-    logger.info(f"   Columnas (primeras 15): {list(df.columns)[:15]}")
-
-    # ─────────────────────────────────────────────────────────
-    # PASO 1: LIMPIEZA
-    # ─────────────────────────────────────────────────────────
-    filas_antes = len(df)
-    columnas_criticas = [columna_waybill, columna_peso, columna_item]
-    faltantes = [c for c in columnas_criticas if c not in df.columns]
-    if faltantes:
-        raise ValueError(
-            f"Columnas críticas faltantes en Outbound: {faltantes}. "
-            f"Columnas disponibles: {list(df.columns)}"
-        )
-
-    df = df.dropna(subset=[columna_waybill])
-    df = df[df[columna_waybill].astype(str).str.strip() != ""]
     
-    # 🔧 NO truncar sufijos como -2, -3, etc. — son waybills distintos
-    # (Solo strip de espacios, sin tocar el contenido)
-    df[columna_waybill] = df[columna_waybill].astype(str).str.strip()   
-
-    df[columna_peso] = pd.to_numeric(df[columna_peso], errors="coerce")
-    df = df.dropna(subset=[columna_peso])
-    df = df[df[columna_peso] > 0]
-
-    filas_descartadas = filas_antes - len(df)
-    if filas_descartadas > 0:
-        msg = f"Se descartaron {filas_descartadas} filas (sin Waybill o peso inválido)"
-        advertencias.append(msg)
-        logger.warning(f"⚠️ {msg}")
-
-    if len(df) == 0:
-        raise ValueError(
-            "Todos los registros fueron descartados. "
-            "Verifica las columnas Waybill, Peso Bruto e Item."
-        )
-
-    # ─────────────────────────────────────────────────────────
-    # PASO 2: INFERIR BU (regla segundo BU)
-    # ─────────────────────────────────────────────────────────
-    if columna_bu not in df.columns:
-        logger.info("   🧠 Columna 'BU' no existe → infiriendo desde Waybill")
-        df[columna_bu] = df[columna_waybill].apply(
-            lambda w: _inferir_bu_desde_waybill(w, usar_ultimo=True)
-        )
-    else:
-        mask_nulos = (
-            df[columna_bu].isna()
-            | (df[columna_bu].astype(str).str.strip() == "")
-        )
-        if mask_nulos.any():
-            n = mask_nulos.sum()
-            logger.info(f"   🧠 Infiriendo BU para {n} filas con BU vacío")
-            df.loc[mask_nulos, columna_bu] = df.loc[mask_nulos, columna_waybill].apply(
-                lambda w: _inferir_bu_desde_waybill(w, usar_ultimo=True)
-            )
-
-    df[columna_bu] = df[columna_bu].fillna("Sin Asignar")
-    df.loc[df[columna_bu].astype(str).str.strip() == "", columna_bu] = "Sin Asignar"
-
-    bus_originales = sorted(df[columna_bu].dropna().unique().tolist())
-    logger.info(f"   ✅ BUs detectados: {bus_originales}")
-
-    # ─────────────────────────────────────────────────────────
-    # PASO 3: APLICAR REGLA MISCELANEUS
-    # ─────────────────────────────────────────────────────────
-    logger.info("🔄 Aplicando regla Miscelaneus...")
-    config_misc = cargar_config_miscelaneus()
-    df, reporte_miscelaneus = aplicar_regla_miscelaneus(
-        df,
-        columna_item=columna_item,
-        columna_bu_origen=columna_bu,
-        columna_bu_destino="BU Final",
-        palabras_sin_filtro=config_misc["palabras_sin_filtro"],
-        palabras_con_filtro_guion=config_misc["palabras_con_filtro_guion"],
-        bu_miscelaneus=config_misc["bu_destino"],
-    )
-
-    if "BU Final" not in df.columns:
-        logger.warning("⚠️ 'BU Final' no se creó. Copiando desde 'BU'.")
-        df["BU Final"] = df[columna_bu]
-
-    n_reasignados = reporte_miscelaneus.get("items_reasignados", 0)
-    if n_reasignados > 0:
-        logger.info(f"   ✅ {n_reasignados} items → '{reporte_miscelaneus['bu_destino']}'")
-    else:
-        logger.info("   ℹ️ Sin items reasignados a Miscelaneus")
-
-    # ═════════════════════════════════════════════════════════
-    # PASO 4: APLICAR COSTOS VARIABLES (fix bug $0.00 mantenido)
-    # ═════════════════════════════════════════════════════════
-    logger.info("💰 Aplicando costos por Waybill...")
-
-    if df_costos is not None:
-        logger.info(f"   🔍 INPUT df_costos: {len(df_costos)} filas")
-        if "Fix Cost" in df_costos.columns:
-            suma_entrada = float(
-                pd.to_numeric(df_costos["Fix Cost"], errors="coerce").sum()
-            )
-            logger.info(f"   🔍 Suma Fix Cost entrante: ${suma_entrada:,.2f}")
-
-    COL_COSTO_INTERNO = "__costo_aplicado__"
-    df[COL_COSTO_INTERNO] = float(costo_fijo)
-
-    n_variables = 0
-    n_default = df[columna_waybill].nunique()
-
-    if df_costos is not None and len(df_costos) > 0:
-        df_costos_temp = df_costos.copy()
-        df_costos_temp["Reference"] = df_costos_temp["Reference"].astype(str).str.strip()
-        df_costos_temp["Fix Cost"] = pd.to_numeric(
-            df_costos_temp["Fix Cost"], errors="coerce"
-        )
-        df_costos_temp = df_costos_temp.dropna(subset=["Fix Cost"])
-        df_costos_temp = df_costos_temp[df_costos_temp["Fix Cost"] > 0]
-        df_costos_temp["Reference_Base"] = df_costos_temp["Reference"].apply(
-            _extraer_reference_base
-        )
-
-        mapa_exacto = dict(zip(df_costos_temp["Reference"], df_costos_temp["Fix Cost"]))
-        mapa_base = dict(zip(df_costos_temp["Reference_Base"], df_costos_temp["Fix Cost"]))
-
-        logger.info(
-            f"   📋 Tabla preparada: {len(mapa_exacto)} exact + {len(mapa_base)} base"
-        )
-
-        def _buscar_costo(waybill_ref) -> float:
-            if not isinstance(waybill_ref, str):
-                waybill_ref = str(waybill_ref) if waybill_ref is not None else ""
-            if not waybill_ref or waybill_ref.lower() == "nan":
-                return float(costo_fijo)
-            if waybill_ref in mapa_exacto:
-                return float(mapa_exacto[waybill_ref])
-            base = _extraer_reference_base(waybill_ref)
-            if base in mapa_base:
-                return float(mapa_base[base])
-            for ref_key, costo_val in mapa_base.items():
-                if ref_key and ref_key in waybill_ref:
-                    return float(costo_val)
-            return float(costo_fijo)
-
-        df[COL_COSTO_INTERNO] = df[columna_waybill].apply(_buscar_costo).astype(float)
-
-        # Métricas POR WAYBILL ÚNICO (no por fila)
-        costos_por_waybill = df.groupby(columna_waybill)[COL_COSTO_INTERNO].first()
-        n_variables = int((costos_por_waybill != costo_fijo).sum())
-        n_default = int((costos_por_waybill == costo_fijo).sum())
-        suma_aplicada = float(costos_por_waybill.sum())
-
-        logger.info(f"   ✅ {n_variables} waybills con costo variable")
-        logger.info(f"   ℹ️ {n_default} waybills con costo default ${costo_fijo}")
-        logger.info(f"   💰 Suma costos únicos por Waybill: ${suma_aplicada:,.2f}")
-    else:
-        logger.info(f"   ℹ️ Sin tabla variable. Default: ${costo_fijo}")
-
-    # Crear 'Fix Cost' definitivo desde la columna interna
-    if "Fix Cost" in df.columns:
-        df = df.drop(columns=["Fix Cost"])
-    df["Fix Cost"] = df[COL_COSTO_INTERNO].astype(float)
-    df = df.drop(columns=[COL_COSTO_INTERNO])
-
-    # ─────────────────────────────────────────────────────────
-    # PASO 5: CALCULAR %PROPORCIÓN Y CALC_EXP
-    # ─────────────────────────────────────────────────────────
-    logger.info("🧮 Calculando %Proporción y Calc_Exp...")
-    df["Peso Total Waybill"] = df.groupby(columna_waybill)[columna_peso].transform("sum")
+    # 🆕 Detectar la mejor columna de "grupo": Waybill Number → Reference como fallback
+    columna_grupo = _detectar_columna_grupo(df, columna_waybill)
+    logger.info(f"   📍 Columna grupo: '{columna_grupo}'")
     
-    # Protección contra división por cero (motor_prorrateo style)
-    peso_seguro = df["Peso Total Waybill"].replace(0, pd.NA)
-    df["%Proporcion"] = (df[columna_peso] / peso_seguro).fillna(0)
-    df["Calc_Exp"] = (df["%Proporcion"] * df["Fix Cost"]).round(decimales)
-    df["Amount"] = df["Calc_Exp"]  # alias legacy
+    df = _normalizar_alias(df, columna_grupo, columna_peso, columna_item)
 
-    # ─────────────────────────────────────────────────────────
-    # PASO 6: VALIDACIÓN POR GRUPO (tolerancia $0.01 desde config)
-    # ─────────────────────────────────────────────────────────
-    cuadre = df.groupby(columna_waybill).agg(
-        suma_calc=("Calc_Exp", "sum"),
-        fix_cost=("Fix Cost", "first"),
+    # 1. INFERIR BU (solo si NO está ya asignado en la columna BU)
+    if "BU" not in df.columns:
+        df["BU"] = None
+    
+    # Contar cuántos BUs ya vienen del Excel
+    n_bus_originales = df["BU"].notna().sum()
+    logger.info(f"   📊 BUs originales del Excel: {n_bus_originales}/{len(df)}")
+    
+    # Solo inferir donde NO hay BU
+    mask_sin_bu = df["BU"].isna() | (df["BU"].astype(str).str.strip() == "")
+    df.loc[mask_sin_bu, "BU"] = df.loc[mask_sin_bu].apply(
+        lambda r: detectar_bu_outbound(
+            r.get(columna_grupo, ""),
+            r.get(columna_item, "")
+        ),
+        axis=1,
     )
-    cuadre["diferencia"] = (cuadre["suma_calc"] - cuadre["fix_cost"]).abs()
-    cuadre["cuadra"] = cuadre["diferencia"] <= tolerancia
-    grupos_descuadrados = cuadre[~cuadre["cuadra"]]
+    
+    bus_detectados = sorted(df["BU"].dropna().unique().tolist())
+    n_bus_finales = df["BU"].notna().sum()
+    n_inferidos = n_bus_finales - n_bus_originales
+    logger.info(f"   ✅ BUs detectados: {bus_detectados}")
+    logger.info(f"   🔍 Inferidos por cascada: {n_inferidos}")
+    logger.info(f"   ❌ Sin BU asignable: {len(df) - n_bus_finales}")
 
-    if len(grupos_descuadrados) > 0:
-        msg = f"🔴 {len(grupos_descuadrados)} waybill(s) NO cuadran (tolerancia ${tolerancia})"
-        advertencias.append(msg)
-        logger.warning(msg)
+    # 2. Regla Miscelaneus
+    resultado_misc = aplicar_regla_miscelaneus(df, columna_item=columna_item)
+    df, n_misc = _normalizar_resultado_misc(resultado_misc, df)
+    df["BU Final"] = df["BU"]
+    if n_misc:
+        logger.info(f"   🔄 Reasignados a Miscelaneus: {n_misc}")
 
-    # Marca de validación por fila
-    df["Validacion"] = df[columna_waybill].map(
-        lambda g: "🟢 OK" if cuadre.loc[g, "cuadra"] else "🔴 DIFF"
+    # 3. Asignar Fix Cost
+    df["Fix Cost"] = _asignar_fix_cost(df, costo_fijo, df_costos, columna_grupo)
+
+    # 4. Calcular %Proportion y Calc_Exp — réplica EXACTA del Excel
+    df["Peso Total Waybill"] = df.groupby(columna_grupo)[columna_peso].transform("sum")
+    df["%Proportion"] = np.where(
+        df["Peso Total Waybill"] > 0,
+        df[columna_peso] / df["Peso Total Waybill"],
+        0.0
     )
+    df["Calc_Exp"] = df["%Proportion"] * df["Fix Cost"]
 
-    # ─────────────────────────────────────────────────────────
-    # PASO 7: RESUMEN POR BU FINAL
-    # ─────────────────────────────────────────────────────────
-    logger.info("📊 Generando resumen por BU Final...")
+    # 5. RESUMEN POR BU FINAL
     resumen_bu = (
-        df.groupby("BU Final")
-        .agg(**{
-            "Monto Total (USD)": ("Calc_Exp", "sum"),
-            "# Waybills":        (columna_waybill, "nunique"),
-            "# Items":           (columna_item, "count"),
-            "Peso Total (Kgs)":  (columna_peso, "sum"),
-        })
-        .reset_index()
+        df.groupby("BU Final", as_index=False, dropna=False)
+        .agg(
+            **{
+                "Log. Exp": ("Calc_Exp", "sum"),
+                "# Items": (columna_item, "count"),
+                "# Waybills": (columna_grupo, "nunique"),
+                "Peso Total (Kgs)": (columna_peso, "sum"),
+            }
+        )
         .rename(columns={"BU Final": "BU"})
     )
+    total_amount = resumen_bu["Log. Exp"].sum()
+    resumen_bu["%PCT"] = resumen_bu["Log. Exp"] / total_amount if total_amount else 0
 
-    total_monto = resumen_bu["Monto Total (USD)"].sum()
-    resumen_bu["%PCT"] = (
-        resumen_bu["Monto Total (USD)"] / total_monto if total_monto > 0 else 0.0
-    )
-    resumen_bu = (
-        resumen_bu
-        .sort_values("Monto Total (USD)", ascending=False)
-        .reset_index(drop=True)
-    )
+    fila_total = pd.DataFrame([{
+        "BU": "Total",
+        "Log. Exp": total_amount,
+        "# Items": resumen_bu["# Items"].sum(),
+        "# Waybills": resumen_bu["# Waybills"].sum(),
+        "Peso Total (Kgs)": resumen_bu["Peso Total (Kgs)"].sum(),
+        "%PCT": 1.0,
+    }])
+    resumen_bu = pd.concat([resumen_bu, fila_total], ignore_index=True)
 
-    # ─────────────────────────────────────────────────────────
-    # PASO 8: RESUMEN POR WAYBILL
-    # ─────────────────────────────────────────────────────────
+    # 6. RESUMEN POR WAYBILL
     resumen_waybills = (
-        df.groupby(columna_waybill)
-        .agg(**{
-            "BU Asignado": (
-                "BU Final",
-                lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else "Sin Asignar"
-            ),
-            "# Items":          (columna_item, "count"),
-            "Peso Total (Kgs)": (columna_peso, "sum"),
-            "Fix Cost":         ("Fix Cost", "first"),
-            "Total Amount":     ("Calc_Exp", "sum"),
-        })
-        .reset_index()
-        .rename(columns={columna_waybill: "Waybill Number"})
+        df.groupby(columna_grupo, as_index=False)
+        .agg(
+            **{
+                "BU Asignado": ("BU Final", lambda x: x.mode().iat[0] if len(x.dropna()) else "—"),
+                "# Items": (columna_item, "count"),
+                "Peso Total (Kgs)": (columna_peso, "sum"),
+                "Fix Cost": ("Fix Cost", "first"),
+                "Total Amount": ("Calc_Exp", "sum"),
+            }
+        )
+        .rename(columns={columna_grupo: "Waybill Number"})
+    )
+    resumen_waybills["Diferencia"] = (
+        resumen_waybills["Total Amount"] - resumen_waybills["Fix Cost"]
+    )
+    resumen_waybills["Validación"] = resumen_waybills["Diferencia"].abs().apply(
+        lambda d: "🟢 OK" if d <= tolerancia else "🔴 Descuadre"
     )
 
-    # ─────────────────────────────────────────────────────────
-    # PASO 9: MÉTRICAS (compatibles con pestania_outbound.py)
-    # ─────────────────────────────────────────────────────────
-    num_waybills = df[columna_waybill].nunique()
-    costo_esperado = float(df.groupby(columna_waybill)["Fix Cost"].first().sum())
+    # 7. MÉTRICAS
+    grupos_desc = int((resumen_waybills["Diferencia"].abs() > tolerancia).sum())
+    costo_esperado = float(resumen_waybills["Fix Cost"].sum())
     costo_calculado = float(df["Calc_Exp"].sum())
-    diferencia = abs(costo_esperado - costo_calculado)
-
-    modo_costo = "variable" if n_variables > 0 else "default"
-
-    # Detectar BUs especiales/nuevos (lee de config, no hardcoded)
-    bus_finales = set(resumen_bu["BU"].tolist())
-    bus_especiales = sorted(bus_finales & bus_especiales_config)
-    bus_nuevos = sorted(
-        bu for bu in bus_finales
-        if bu not in bus_especiales_config
-        and not re.match(r"^M\d{2}$", str(bu))
-        and bu != "SIN_BU"
-    )
+    validacion_ok = bool(abs(costo_esperado - costo_calculado) <= tolerancia and grupos_desc == 0)
 
     metricas = {
-        # ──── Básicas ────
-        "total_items":            len(df),
-        "total_waybills":         num_waybills,
-        "total_bus":              len(resumen_bu),
-        "bus_detectados":         resumen_bu["BU"].tolist(),
-        "costo_fijo_default":     costo_fijo,
-        "costo_total_esperado":   round(costo_esperado, decimales),
-        "costo_total_calculado":  round(costo_calculado, decimales),
-        "diferencia_validacion":  round(diferencia, 4),
-        "validacion_ok":          diferencia <= tolerancia,
-        "tolerancia_aplicada":    tolerancia,
-        "grupos_descuadrados":    len(grupos_descuadrados),
-        "filas_descartadas":      filas_descartadas,
-
-        # ──── Modo costo ────
-        "modo_costo":             modo_costo,
-        "n_waybills_variables":   n_variables,
-        "n_waybills_default":     num_waybills - n_variables,
-
-        # ──── BUs especiales / nuevos ────
-        "bus_especiales":         bus_especiales,
-        "bus_nuevos":             bus_nuevos,
-
-        # ──── Reporte Miscelaneus ────
-        "miscelaneus": {
-            "items_reasignados": reporte_miscelaneus.get("items_reasignados", 0),
-            "monto_reasignado":  reporte_miscelaneus.get("monto_reasignado", 0.0),
-            "bus_origen":        reporte_miscelaneus.get("bus_origen_reasignados", []),
-        },
+        "total_items": int(len(df)),
+        "total_waybills": int(df[columna_grupo].nunique()),
+        "bus_detectados": sorted(df["BU Final"].dropna().unique().tolist()),
+        "costo_esperado": costo_esperado,
+        "costo_total_calculado": costo_calculado,
+        "modo_costo": "variable" if df_costos is not None and len(df_costos) > 0 else "default",
+        "tolerancia": float(tolerancia),
+        "grupos_descuadrados": grupos_desc,
+        "items_reasignados_misc": int(n_misc),
+        "validacion_ok": validacion_ok,
+        "columna_grupo_usada": columna_grupo,  # 🆕 para debugging
     }
 
-    # ─────────────────────────────────────────────────────────
-    # LOG FINAL
-    # ─────────────────────────────────────────────────────────
     logger.info("─" * 60)
-    logger.info(f"✅ Items procesados:       {metricas['total_items']}")
-    logger.info(f"✅ Waybills únicos:        {metricas['total_waybills']}")
-    logger.info(f"✅ BUs detectados:         {metricas['bus_detectados']}")
-    logger.info(f"💰 Costo esperado:         ${metricas['costo_total_esperado']:,.2f}")
-    logger.info(f"💰 Costo calculado:        ${metricas['costo_total_calculado']:,.2f}")
-    logger.info(f"💵 Modo costo:             {metricas['modo_costo']}")
-    logger.info(f"🎯 Tolerancia:             ${metricas['tolerancia_aplicada']}")
-    logger.info(f"🔴 Grupos descuadrados:    {metricas['grupos_descuadrados']}")
-    logger.info(f"🔄 Items reasignados:      {metricas['miscelaneus']['items_reasignados']}")
-    logger.info(f"✅ Validación OK:          {metricas['validacion_ok']}")
+    logger.info(f"✅ Items procesados: {metricas['total_items']}")
+    logger.info(f"✅ Waybills únicos:  {metricas['total_waybills']}")
+    logger.info(f"✅ BUs:              {metricas['bus_detectados']}")
+    logger.info(f"💰 Costo total:      ${metricas['costo_total_calculado']:,.2f}")
+    logger.info(f"💵 Modo:             {metricas['modo_costo']}")
+    logger.info(f"✅ Validación OK:    {metricas['validacion_ok']}")
     logger.info("=" * 60)
 
     return ResultadoOutbound(
-        detalle=df,
+        df_detalle=df,
         resumen_bu=resumen_bu,
         resumen_waybills=resumen_waybills,
         metricas=metricas,
-        advertencias=advertencias,
-        reporte_miscelaneus=reporte_miscelaneus,
     )
 
+
+# ════════════════════════════════════════════════════════════
+# AUXILIARES
+# ════════════════════════════════════════════════════════════
+def _detectar_columna_grupo(df: pd.DataFrame, preferida: str) -> str:
+    """
+    🆕 v6.3: Detecta la mejor columna para agrupar.
+    Prioridad: Waybill Number → Waybill → Reference (fallback)
+    """
+    candidatos = [preferida, "Waybill Number", "Waybill", "Reference"]
+    for c in candidatos:
+        if c in df.columns and df[c].notna().any():
+            return c
+    # Último recurso
+    return df.columns[0]
+
+
+def _normalizar_alias(
+    df: pd.DataFrame, col_waybill: str, col_peso: str, col_item: str
+) -> pd.DataFrame:
+    """Garantiza que las columnas requeridas existan (con fallbacks)."""
+    df = df.copy()
+    if col_waybill not in df.columns:
+        for alt in ["Waybill Number", "Waybill", "Reference"]:
+            if alt in df.columns:
+                df[col_waybill] = df[alt]
+                logger.info(f"   🔄 '{alt}' usado como '{col_waybill}'")
+                break
+    if col_peso not in df.columns:
+        for alt in ["Gross Weight", "Gross Weight (Kgs)", "Peso Bruto (Kgs)"]:
+            if alt in df.columns:
+                df[col_peso] = df[alt]
+                break
+    if col_item not in df.columns:
+        for alt in ["Item Code", "Part Number", "No. Parte Prov."]:
+            if alt in df.columns:
+                df[col_item] = df[alt]
+                break
+    return df
+
+
+def _asignar_fix_cost(
+    df: pd.DataFrame,
+    costo_default: float,
+    df_costos: Optional[pd.DataFrame],
+    columna_waybill: str,
+) -> pd.Series:
+    """Replica XLOOKUP(BI, $BC:$BC, $BE:$BE) con fallback al default."""
+    if df_costos is None or len(df_costos) == 0:
+        logger.info(f"   ℹ️ Sin tabla variable → tarifa fija ${costo_default:,.2f}")
+        return pd.Series(costo_default, index=df.index, dtype=float)
+
+    df_c = df_costos.copy()
+
+    col_ref_costos = next(
+        (c for c in df_c.columns if str(c).strip().lower() in ("reference", "waybill", "waybill number")),
+        df_c.columns[0]
+    )
+    col_costo = next(
+        (c for c in df_c.columns if "cost" in str(c).lower() or "tarifa" in str(c).lower() or "fix" in str(c).lower()),
+        df_c.columns[1] if len(df_c.columns) > 1 else df_c.columns[0]
+    )
+
+    df_c[col_ref_costos] = df_c[col_ref_costos].astype(str).str.strip()
+    waybills_norm = df[columna_waybill].astype(str).str.strip()
+
+    mapa = dict(zip(df_c[col_ref_costos], pd.to_numeric(df_c[col_costo], errors="coerce")))
+    fix_cost = waybills_norm.map(mapa).fillna(costo_default)
+
+    n_match = int(waybills_norm.isin(mapa.keys()).sum())
+    logger.info(f"   ✅ XLOOKUP: {n_match}/{len(df)} items con tarifa variable")
+
+    return fix_cost.astype(float)

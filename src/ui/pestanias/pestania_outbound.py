@@ -330,9 +330,9 @@ def renderizar() -> None:
         # ───────────────────────────────────────────────────
         # DETALLE COMPLETO
         # ───────────────────────────────────────────────────
-        with st.expander(f"🔍 Ver detalle completo ({len(resultado.detalle):,} filas)"):
+        with st.expander(f"🔍 Ver detalle completo ({len(resultado.df_detalle):,} filas)"):
             st.dataframe(
-                resultado.detalle,
+                resultado.df_detalle,
                 use_container_width=True,
                 hide_index=True,
             )
